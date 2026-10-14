@@ -79,19 +79,21 @@ class MdocBleReader:
     """GATT-client side of an mdoc BLE session.
 
     Usage:
-        async with MdocBleReader(device) as link:
+        async with MdocBleReader(device, service_uuid) as link:
             await link.send(session_establishment)
             response = await link.receive()
             await link.send(session_termination)
     """
 
-    def __init__(self, device, *, verbose: bool = False):
+    def __init__(self, device, service_uuid: str, *, verbose: bool = False):
         self._device = device
+        self._service_uuid = service_uuid
         self._verbose = verbose
         self._client: BleakClient | None = None
         self._incoming: asyncio.Queue[bytes] = asyncio.Queue()
         self._parts: list[bytes] = []
         self._state_events: asyncio.Queue[int] = asyncio.Queue()
+        self._state = self._client_to_server = self._server_to_client = None
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -102,16 +104,54 @@ class MdocBleReader:
     async def __aexit__(self, *_exc) -> None:
         await self.close()
 
+    def _resolve_characteristics(self) -> None:
+        """Bind the three characteristics *inside our service*.
+
+        Not by bare UUID across the whole GATT database. Every transaction uses
+        a fresh service UUID but the same three characteristic UUIDs, and macOS
+        caches a peripheral's services, so the second time you talk to a wallet
+        there are several characteristics called `00000001-a123-…`. bleak
+        refuses to guess between them, and it is right to: writing Start to a
+        dead service's State would hang with no diagnostic.
+        """
+        wanted = self._service_uuid.lower()
+        services = [s for s in self._client.services if s.uuid.lower() == wanted]
+        if not services:
+            offered = [s.uuid for s in self._client.services]
+            raise BleTransportError(
+                f"peripheral offers no service {self._service_uuid}; it has {offered}")
+        if len(services) > 1:
+            # Shouldn't happen — the UUID is per-transaction — but if the cache
+            # has gone strange, the newest copy is the live one.
+            self._log(f"{len(services)} copies of {wanted} cached; using the last")
+        service = services[-1]
+
+        def pick(uuid: str, name: str):
+            for characteristic in service.characteristics:
+                if characteristic.uuid.lower() == uuid.lower():
+                    return characteristic
+            raise BleTransportError(
+                f"service {service.uuid} has no {name} characteristic ({uuid}). "
+                "Is the mdoc in peripheral server mode?")
+
+        self._state = pick(STATE_UUID, "State")
+        self._client_to_server = pick(CLIENT_TO_SERVER_UUID, "Client2Server")
+        self._server_to_client = pick(SERVER_TO_CLIENT_UUID, "Server2Client")
+        self._log(f"service {service.uuid}: State h{self._state.handle}, "
+                  f"Client2Server h{self._client_to_server.handle}, "
+                  f"Server2Client h{self._server_to_client.handle}")
+
     async def open(self) -> None:
         self._client = BleakClient(self._device)
         await self._client.connect()
         self._log(f"connected to {self._device.address}, MTU {self.mtu}")
+        self._resolve_characteristics()
 
         # 8.3.3.1.1.5 step order matters: subscribe first, only then signal Start,
         # or the mdoc's first notification can land before we are listening.
-        await self._client.start_notify(STATE_UUID, self._on_state)
-        await self._client.start_notify(SERVER_TO_CLIENT_UUID, self._on_data)
-        await self._client.write_gatt_char(STATE_UUID, STATE_START, response=False)
+        await self._client.start_notify(self._state, self._on_state)
+        await self._client.start_notify(self._server_to_client, self._on_data)
+        await self._client.write_gatt_char(self._state, STATE_START, response=False)
         self._log("sent State=Start (0x01)")
 
     async def close(self, *, send_end: bool = True) -> None:
@@ -119,9 +159,10 @@ class MdocBleReader:
             return
         try:
             if send_end:
-                await self._client.write_gatt_char(STATE_UUID, STATE_END, response=False)
-            await self._client.stop_notify(SERVER_TO_CLIENT_UUID)
-            await self._client.stop_notify(STATE_UUID)
+                await self._client.write_gatt_char(self._state, STATE_END,
+                                                   response=False)
+            await self._client.stop_notify(self._server_to_client)
+            await self._client.stop_notify(self._state)
         except Exception as exc:  # a dropped link during teardown is not interesting
             self._log(f"teardown warning: {exc}")
         finally:
@@ -176,7 +217,7 @@ class MdocBleReader:
         for index, chunk in enumerate(chunks):
             last = index == len(chunks) - 1
             await self._client.write_gatt_char(
-                CLIENT_TO_SERVER_UUID,
+                self._client_to_server,
                 bytes([CHUNK_LAST if last else CHUNK_MORE]) + chunk,
                 response=False,
             )

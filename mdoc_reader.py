@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-An ISO/IEC 18013-5 mdoc reader in Python: QR engagement + BLE + validation.
+An ISO/IEC 18013-5 mdoc reader in Python: engagement + BLE + validation.
 
-Composes the three verified modules:
+Composes the verified modules:
 
     mdoc_transcript  engagement parsing, SessionTranscript, session keys
+    mdoc_nfc         NFC static handover over PC/SC (optional)
     mdoc_ble         GATT client transport (mdoc peripheral server mode)
     mdoc_auth        issuer data authentication, value digests, mdoc auth
 
@@ -12,11 +13,16 @@ Usage:
     .venv/bin/python mdoc_reader.py 'mdoc:owBjMS4w...'
     .venv/bin/python mdoc_reader.py --dry-run 'mdoc:...'        # no radio
     .venv/bin/python mdoc_reader.py --trust-anchor iaca.pem 'mdoc:...'
+    .venv/bin/python mdoc_reader.py --nfc --trust-anchor iaca.pem
+
+Both engagement routes end in the same BLE session; they differ only in where
+the DeviceEngagement comes from and in the Handover element of the transcript
+(null for QR, [HandoverSelect, null] for NFC static handover).
 
 The engagement QR is single-use and short-lived: scan it, run this within
 seconds. A stale URI gives a device that is no longer advertising.
 
-Requires: cbor2, cryptography, bleak
+Requires: cbor2, cryptography, bleak; pyscard for --nfc
 """
 from __future__ import annotations
 
@@ -153,29 +159,36 @@ def validate_response(device_response: dict, session_transcript: bytes,
     return all_ok
 
 
-async def run(uri: str, doc_type: str, namespaces: dict, anchors: list,
-              *, require_chain: bool, dry_run: bool, verbose: bool,
+async def run(device_engagement_raw: bytes, doc_type: str, namespaces: dict,
+              anchors: list, *, handover=None, service_uuid_override: bytes | None = None,
+              require_chain: bool, dry_run: bool, verbose: bool,
               save: str | None = None) -> int:
-    engagement = parse_device_engagement(parse_mdoc_uri(uri))
+    engagement = parse_device_engagement(device_engagement_raw)
     print(f"Engagement: version {engagement.version}, cipher suite "
           f"{engagement.cipher_suite}")
 
-    if engagement.ble is None:
-        print("No BLE retrieval method in this engagement.", file=sys.stderr)
-        return 2
-    if not engagement.ble.reader_is_gatt_client:
-        print("Wallet wants mdoc central client mode; this reader only supports "
-              "mdoc peripheral server mode (see mdoc_ble docstring).", file=sys.stderr)
-        return 2
-
-    service_uuid = mdoc_ble.service_uuid_str(engagement.ble.service_uuid)
-    print(f"Transport: BLE, mdoc peripheral server mode, service {service_uuid}")
+    if service_uuid_override is not None:
+        # NFC static handover: the engagement carries no retrieval methods, so
+        # the transport comes from the NDEF Bluetooth LE OOB carrier instead.
+        service_uuid = mdoc_ble.service_uuid_str(service_uuid_override)
+        print(f"Transport: BLE, mdoc peripheral server mode, service {service_uuid} "
+              f"(from the NFC carrier)")
+    else:
+        if engagement.ble is None:
+            print("No BLE retrieval method in this engagement.", file=sys.stderr)
+            return 2
+        if not engagement.ble.reader_is_gatt_client:
+            print("Wallet wants mdoc central client mode; this reader only supports "
+                  "mdoc peripheral server mode (see mdoc_ble docstring).", file=sys.stderr)
+            return 2
+        service_uuid = mdoc_ble.service_uuid_str(engagement.ble.service_uuid)
+        print(f"Transport: BLE, mdoc peripheral server mode, service {service_uuid}")
 
     # Fresh ephemeral key per transaction — these are never reused (9.1.1.4).
     ereader_private = ec.generate_private_key(ec.SECP256R1())
     ereader_cose_key = encode_ereader_cose_key(ereader_private.public_key())
 
-    transcript = build_session_transcript(engagement.raw, ereader_cose_key)
+    transcript = build_session_transcript(engagement.raw, ereader_cose_key, handover)
     stb = session_transcript_bytes(transcript)
     keys = derive_session_keys(ereader_private, engagement.edevice_key_public, stb)
     print(f"SessionTranscript: {len(transcript)} bytes, SKReader "
@@ -201,7 +214,7 @@ async def run(uri: str, doc_type: str, namespaces: dict, anchors: list,
         return 1
     print(f"Found {device.address} ({device.name or 'unnamed'})")
 
-    async with mdoc_ble.MdocBleReader(device, verbose=verbose) as link:
+    async with mdoc_ble.MdocBleReader(device, service_uuid, verbose=verbose) as link:
         await link.send(establishment)
         print("Request sent. Waiting for the holder to consent on the handset…")
         raw = await link.receive()
@@ -244,36 +257,25 @@ def main() -> int:
                         help="decode the QR from a screenshot or photo instead")
     parser.add_argument("--from-adb", nargs="?", const="", metavar="SERIAL",
                         help="screencap the attached handset and decode its QR")
+    parser.add_argument("--nfc", action="store_true",
+                        help="engage by NFC tap on a PC/SC contactless reader "
+                             "instead of scanning a QR")
+    parser.add_argument("--nfc-reader", metavar="NAME",
+                        help="substring of the PC/SC reader name to use")
     parser.add_argument("--doc-type", default=DEFAULT_DOC_TYPE)
     parser.add_argument("--trust-anchor", action="append", default=[], metavar="PEM",
                         help="IACA certificate; repeatable")
     parser.add_argument("--dry-run", action="store_true",
                         help="build the request and stop before using the radio")
     parser.add_argument("--wait", type=float, default=0.0, metavar="SECONDS",
-                        help="with --from-adb, poll the screen until a QR appears")
+                        help="how long to wait for the engagement: with --from-adb "
+                             "poll the handset screen, with --nfc wait for a tap")
     parser.add_argument("--save", metavar="PATH",
                         help="write the decrypted response and its transcript as CBOR")
     parser.add_argument("-v", "--verbose", action="store_true", help="BLE tracing")
     args = parser.parse_args()
 
-    uri = args.uri
-    if args.from_image or args.from_adb is not None:
-        import qr_engagement
-        try:
-            if args.from_image:
-                uri = qr_engagement.uri_from_image(args.from_image)
-            else:
-                if args.wait:
-                    print(f"Waiting up to {args.wait:.0f}s for a QR on the handset…")
-                uri = qr_engagement.uri_from_adb(args.from_adb or None, wait=args.wait)
-        except qr_engagement.QrError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        print(f"Scanned QR: {uri[:40]}…\n")
-    if not uri:
-        parser.error("give an mdoc: URI, or --from-image / --from-adb")
-
-    anchors =[x509.load_pem_x509_certificate(open(p, "rb").read())
+    anchors = [x509.load_pem_x509_certificate(open(p, "rb").read())
                for p in args.trust_anchor]
     if not anchors:
         print("WARNING: no --trust-anchor given. The issuer signature will be "
@@ -283,7 +285,58 @@ def main() -> int:
     namespaces = (DEFAULT_ELEMENTS if args.doc_type == DEFAULT_DOC_TYPE
                   else {args.doc_type: {}})
 
-    return asyncio.run(run(uri, args.doc_type, namespaces, anchors,
+    handover = None
+    service_uuid_override = None
+
+    if args.nfc:
+        import mdoc_nfc
+        timeout = args.wait or 60.0
+        print(f"Tap the handset on the contactless reader (up to {timeout:.0f}s)…")
+        try:
+            nfc = mdoc_nfc.engage(reader_name=args.nfc_reader, timeout=timeout,
+                                  verbose=args.verbose)
+        except mdoc_nfc.NfcError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if not nfc.reader_is_gatt_client:
+            print(f"The handover offers LE role {nfc.le_role} (mdoc as central); "
+                  "this reader only supports mdoc peripheral server mode.",
+                  file=sys.stderr)
+            return 2
+        if nfc.service_uuid is None:
+            print("The LE OOB carrier names no service UUID — nothing to scan for.",
+                  file=sys.stderr)
+            return 2
+        print(f"NFC engagement: {len(nfc.handover_select)} byte Handover Select, "
+              f"{len(nfc.device_engagement_raw)} byte DeviceEngagement\n")
+        device_engagement_raw = nfc.device_engagement_raw
+        # 9.1.5.1 — the Handover Select goes into the transcript exactly as read;
+        # the second element is null because this is a static handover.
+        handover = nfc.handover
+        service_uuid_override = nfc.service_uuid
+    else:
+        uri = args.uri
+        if args.from_image or args.from_adb is not None:
+            import qr_engagement
+            try:
+                if args.from_image:
+                    uri = qr_engagement.uri_from_image(args.from_image)
+                else:
+                    if args.wait:
+                        print(f"Waiting up to {args.wait:.0f}s for a QR on the handset…")
+                    uri = qr_engagement.uri_from_adb(args.from_adb or None,
+                                                     wait=args.wait)
+            except qr_engagement.QrError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            print(f"Scanned QR: {uri[:40]}…\n")
+        if not uri:
+            parser.error("give an mdoc: URI, or --from-image / --from-adb / --nfc")
+        device_engagement_raw = parse_mdoc_uri(uri)
+
+    return asyncio.run(run(device_engagement_raw, args.doc_type, namespaces, anchors,
+                           handover=handover,
+                           service_uuid_override=service_uuid_override,
                            require_chain=bool(anchors), dry_run=args.dry_run,
                            verbose=args.verbose, save=args.save))
 
