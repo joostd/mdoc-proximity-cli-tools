@@ -62,7 +62,7 @@ first, bring up the wallet screen second.
 
 | File | Role |
 |---|---|
-| `mdoc_transcript.py` | Engagement parsing, SessionTranscript, session key derivation |
+| `mdoc_transcript.py` | Engagement parsing *and* generation, SessionTranscript, session key derivation |
 | `mdoc_transport.py` | The `MdocTransport` contract, plus a radio-free loopback link |
 | `mdoc_ble.py` | GATT-client transport — scan, subscribe, `State=Start`, MTU−3 chunking |
 | `mdoc_ble_peripheral.py` | GATT-*server* transport, for mdoc central client mode |
@@ -76,9 +76,9 @@ first, bring up the wallet screen second.
 | File | Role |
 |---|---|
 | `mdoc_issuer.py` | Mints a credential: MSO, value digests, a two-level PKI, the mandatory mDL elements |
-| `mdoc_holder.py` | Parses a DeviceRequest, decides what to disclose, signs a DeviceResponse |
+| `mdoc_holder.py` | Parses a DeviceRequest, decides what to disclose, signs a DeviceResponse — and `HolderSession` runs the whole session, QR included |
 
-### Tests — 119 checks, all passing
+### Tests — 137 checks, all passing
 
 | File | Checks | Against what |
 |---|---|---|
@@ -89,10 +89,12 @@ first, bring up the wallet screen second.
 | `test_mdoc_nfc.py` | 27 | The Annex D.5.1 handover, plus a Handover Select read off the wallet |
 | `test_mdoc_transport.py` | 16 | Loopback framing — chunk prefixes, State ordering, reassembly |
 | `test_mdoc_holder.py` | 19 | Issuer → holder → reader in one process, including over-disclosure |
+| `test_mdoc_session.py` | 18 | A whole presentation over the loopback: QR, ECDH, AES-GCM, both roles |
 
 ```sh
 for t in d51_session_encryption_test test_mdoc_transcript test_mdoc_auth \
-         test_mdoc_reader test_mdoc_nfc test_mdoc_transport test_mdoc_holder
+         test_mdoc_reader test_mdoc_nfc test_mdoc_transport test_mdoc_holder \
+         test_mdoc_session
 do .venv/bin/python $t.py; done
 ```
 
@@ -189,6 +191,45 @@ seriously is the per-item `random` salt (32 bytes from `secrets`, against the
 16-byte minimum in 9.1.2.5), because that salt is the only thing stopping a
 verifier brute-forcing `age_over_18` from the digests of the elements the
 holder *declined* to disclose.
+
+#### The session, not just the CBOR
+
+`mdoc_holder.HolderSession` wraps the holder in the half of the protocol the
+reader already had: generate an ephemeral key and a service UUID, encode them
+into a DeviceEngagement, hand out the `mdoc:` URI, and from the reader's
+SessionEstablishment derive `SKReader` / `SKDevice` and answer encrypted.
+`mdoc_transcript.build_device_engagement` is the inverse of the parser that has
+been reading wallets' QR codes since the start; `mdoc_uri` is the inverse of
+`parse_mdoc_uri`.
+
+So `test_mdoc_session.py` runs both roles as concurrent tasks over
+`loopback_pair()`, and the reader half is written *from the engagement* rather
+than handed the mdoc's state. That is what makes it worth running: the two
+sides build the SessionTranscript independently, and if they disagree by one
+byte the only symptom is an AES-GCM tag mismatch. One check asserts exactly
+that, by appending a single `0x00` to the mdoc's engagement after the reader
+has read it:
+
+```
+PASS  both sides derived the same SessionTranscript
+      201 bytes, independently built
+PASS  an mdoc whose engagement drifted cannot decrypt the request
+      rejected: InvalidTag
+```
+
+ECDH is symmetric, so `derive_session_keys` serves both roles unchanged — the
+mdoc calls it as `derive_session_keys(edevice_private, ereader_public, stb)`.
+Its parameter names stay reader-centric because that is where it is used in
+anger.
+
+What this is still not is a wallet. There is no holder consent, no UI, no key
+attestation, and `HolderSession` has never driven a real radio — it speaks the
+`MdocTransport` contract, so `mdoc_ble.py` would accept it, but nothing in this
+repo has yet advertised as an mdoc. And `deviceMac` remains unwired: the holder
+only signs. The MAC variant needs `EMacKey` derived from the device key agreement
+and a correspondingly different `deviceKeyInfo`, and `mdoc_auth` verifies it
+against the Annex D.5.3 vector but has still never seen it from a live
+counterparty.
 
 ### Two ways in: QR and NFC
 
@@ -379,9 +420,15 @@ Start write into a dead service and a silent hang.
 - **No reader authentication.** The `DeviceRequest` carries no `readerAuth`, so
   the wallet cannot tell who is asking and will say so. Fixing this needs a
   reader certificate the wallet's trust list recognises.
-- **`deviceMac` is implemented but not wired into the driver.** It is verified
+- **`deviceMac` is implemented but still unwired at both ends.** It is verified
   against the Annex D.5.3 vectors in `test_mdoc_auth.py`; `mdoc_reader.py` only
-  takes the `deviceSignature` path, which is what the EUDI wallet uses.
+  takes the `deviceSignature` path, which is what the EUDI wallet uses, and
+  `mdoc_holder.py` only emits that path. A holder we control is the natural way
+  to close it — it needs `EMacKey` from the device key agreement and a
+  `deviceKeyInfo` to match — but writing the holder did not close it by itself.
+- **`HolderSession` has never driven a radio.** It speaks the `MdocTransport`
+  contract, so `mdoc_ble.py` would take it, but nothing here has advertised as
+  an mdoc. Everything the holder has presented, it presented over the loopback.
 - **NFC engagement only, static handover only.** ISO 18013-5 also defines NFC
   *data retrieval* (8.3.3.2), running the whole session over APDUs with no
   radio handover at all; the EUDI wallet does not implement it. Negotiated

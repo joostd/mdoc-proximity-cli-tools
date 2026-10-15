@@ -138,6 +138,59 @@ def parse_device_engagement(raw: bytes) -> DeviceEngagement:
     )
 
 
+def build_device_engagement(
+    edevice_cose_key_raw: bytes,
+    *,
+    service_uuid: bytes,
+    peripheral_server_mode: bool = True,
+    central_client_mode: bool = False,
+    peripheral_server_address: bytes | None = None,
+) -> bytes:
+    """8.2.1.1 — the mdoc's side of engagement, the inverse of the parser above.
+
+    The returned bytes are canonical: whatever the mdoc puts on the QR is what
+    goes into the transcript, so an mdoc must keep *these* bytes rather than
+    rebuild them later. `mdoc_holder.HolderSession` does.
+
+    BleOptions keys 0 and 1 are the mode support flags, and 10 and 11 the
+    per-mode service UUIDs. Offering a mode without its UUID is the misreading
+    `choose_ble_mode` exists to reject, so refuse to encode one.
+    """
+    if len(service_uuid) != 16:
+        raise ValueError(f"service UUID must be 16 bytes, got {len(service_uuid)}")
+    if not (peripheral_server_mode or central_client_mode):
+        raise ValueError("engagement must offer at least one BLE mode")
+
+    options: dict[int, object] = {
+        BLE_PERIPHERAL_SERVER_MODE: peripheral_server_mode,
+        BLE_CENTRAL_CLIENT_MODE: central_client_mode,
+    }
+    if peripheral_server_mode:
+        options[BLE_PERIPHERAL_SERVER_UUID] = service_uuid
+    if central_client_mode:
+        options[BLE_CENTRAL_CLIENT_UUID] = service_uuid
+    if peripheral_server_address is not None:
+        options[BLE_PERIPHERAL_SERVER_ADDRESS] = peripheral_server_address
+
+    return cbor2.dumps({
+        DE_VERSION: "1.0",
+        DE_SECURITY: [1, tag24(edevice_cose_key_raw)],  # cipher suite 1 = P-256
+        # [type, version, options]: type 2 is BLE, and the 1 is the *retrieval
+        # method* version, not a mode. See Corrections in the README.
+        DE_DEVICE_RETRIEVAL_METHODS: [[RETRIEVAL_TYPE_BLE, 1, options]],
+    })
+
+
+def mdoc_uri(device_engagement_raw: bytes) -> str:
+    """Raw DeviceEngagement CBOR -> the `mdoc:` URI that goes on the QR.
+
+    Unpadded base64url, matching what `parse_mdoc_uri` accepts and what both
+    tested wallets emit.
+    """
+    payload = base64.urlsafe_b64encode(device_engagement_raw).decode("ascii")
+    return "mdoc:" + payload.rstrip("=")
+
+
 def tag24(payload: bytes) -> cbor2.CBORTag:
     """#6.24(bstr .cbor X) — the 'embedded CBOR' wrapper used throughout 18013-5."""
     return cbor2.CBORTag(24, payload)
@@ -190,7 +243,14 @@ def derive_session_keys(
     edevice_public: ec.EllipticCurvePublicKey,
     transcript_bytes: bytes,
 ) -> dict[str, bytes]:
-    """9.1.1.5 — ECKA-DH then HKDF-SHA256 salted with SHA-256(SessionTranscriptBytes)."""
+    """9.1.1.5 — ECKA-DH then HKDF-SHA256 salted with SHA-256(SessionTranscriptBytes).
+
+    The parameter names are reader-centric, but ECDH is symmetric: an mdoc
+    calls this as `derive_session_keys(edevice_private, ereader_public, stb)`
+    and gets the identical pair. Both sides then encrypt with their own key
+    and decrypt with the other's — SKReader for reader->mdoc, SKDevice for
+    mdoc->reader, regardless of who is computing them.
+    """
     zab = ereader_private.exchange(ec.ECDH(), edevice_public)
     salt = hashlib.sha256(transcript_bytes).digest()
     return {

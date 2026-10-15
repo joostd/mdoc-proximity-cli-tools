@@ -28,6 +28,7 @@ Requires: cbor2, cryptography
 """
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
 from enum import Enum
 
@@ -35,9 +36,20 @@ import cbor2
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 from mdoc_auth import COSE_ALG_ES256, build_device_authentication_bytes
 from mdoc_issuer import Credential
-from mdoc_transcript import tag24
+from mdoc_transcript import (
+    build_device_engagement,
+    build_session_transcript,
+    derive_session_keys,
+    encode_ereader_cose_key,
+    mdoc_uri,
+    session_nonce,
+    session_transcript_bytes,
+    tag24,
+)
 
 # 8.3.2.1.2.2 Table 8 — DeviceResponse status codes.
 STATUS_OK = 0
@@ -240,3 +252,129 @@ class MdocHolder:
     def _log(self, message: str) -> None:
         if self._verbose:
             print(f"[holder] {message}")
+
+
+# --- the session layer ------------------------------------------------------
+
+class HolderSession:
+    """One presentation, from generating the QR to answering the request.
+
+    The mdoc's mirror of `mdoc_reader.run()`:
+
+        session = HolderSession(holder)
+        print(session.uri)                       # on the QR
+        reply = session.handle(establishment)    # SessionData, encrypted
+        session.handle(termination)              # -> None
+
+    `engagement_raw` is retained verbatim and spliced into the transcript. An
+    mdoc that rebuilt its engagement from a decoded copy would derive
+    different session keys from the reader and see only a GCM tag mismatch,
+    which is the same trap the reader has on the other side.
+    """
+
+    def __init__(self, holder: MdocHolder, *, service_uuid: bytes | None = None,
+                 central_client_mode: bool = False, handover=None,
+                 verbose: bool = False):
+        # Fresh ephemeral key *and* a fresh service UUID per transaction
+        # (9.1.1.4, 8.3.3.1.1.3). Reusing either across sessions would let an
+        # observer link them.
+        self._holder = holder
+        self._verbose = verbose
+        self._handover = handover
+        self._edevice_private = ec.generate_private_key(ec.SECP256R1())
+        self.service_uuid = service_uuid or secrets.token_bytes(16)
+        self.engagement_raw = build_device_engagement(
+            encode_ereader_cose_key(self._edevice_private.public_key()),
+            service_uuid=self.service_uuid,
+            peripheral_server_mode=not central_client_mode,
+            central_client_mode=central_client_mode,
+        )
+        self.transcript: bytes | None = None
+        self._keys: dict[str, bytes] | None = None
+        self.terminated = False
+
+    @property
+    def uri(self) -> str:
+        """The `mdoc:` URI a wallet would render as a QR code."""
+        return mdoc_uri(self.engagement_raw)
+
+    def handle(self, message: bytes) -> bytes | None:
+        """Process one message from the reader and return the reply, if any.
+
+        A SessionEstablishment carries the reader's ephemeral key and the
+        encrypted request. A later message carries only `data`, or a `status`
+        — 20 is termination, after which there is nothing to answer.
+        """
+        envelope = cbor2.loads(message)
+        if not isinstance(envelope, dict):
+            raise HolderError(f"session message is {type(envelope).__name__}, not a map")
+
+        if "eReaderKey" in envelope:
+            self._establish(envelope["eReaderKey"])
+        if self._keys is None:
+            raise HolderError("session data arrived before SessionEstablishment")
+
+        if "data" not in envelope:
+            status = envelope.get("status")
+            self.terminated = True
+            self._log(f"session ended by the reader, status {status}")
+            return None
+
+        request = AESGCM(self._keys["SKReader"]).decrypt(
+            session_nonce(1, reader=True), envelope["data"], None)
+        self._log(f"decrypted a {len(request)} byte DeviceRequest")
+
+        response = self._holder.respond(request, self.transcript)
+        ciphertext = AESGCM(self._keys["SKDevice"]).encrypt(
+            session_nonce(1, reader=False), response, None)
+        return cbor2.dumps({"data": ciphertext})
+
+    def _establish(self, ereader_key_bytes) -> None:
+        """9.1.1.4 — bind the reader's ephemeral key into the transcript.
+
+        EReaderKeyBytes goes into the transcript as the exact `#6.24` the
+        reader sent, not a re-wrap of the key we decoded out of it.
+        """
+        if not (isinstance(ereader_key_bytes, cbor2.CBORTag)
+                and ereader_key_bytes.tag == 24):
+            raise HolderError("eReaderKey is not a #6.24 tagged byte string")
+        raw = ereader_key_bytes.value
+
+        cose = cbor2.loads(raw)
+        if cose.get(-1) != 1:
+            raise HolderError(f"unsupported COSE curve {cose.get(-1)!r}; P-256 only")
+        ereader_public = ec.EllipticCurvePublicNumbers(
+            int.from_bytes(cose[-2], "big"),
+            int.from_bytes(cose[-3], "big"),
+            ec.SECP256R1()).public_key()
+
+        self.transcript = build_session_transcript(
+            self.engagement_raw, raw, self._handover)
+        self._keys = derive_session_keys(
+            self._edevice_private, ereader_public,
+            session_transcript_bytes(self.transcript))
+        self._log(f"SessionTranscript {len(self.transcript)} bytes, SKDevice "
+                  f"{self._keys['SKDevice'][:8].hex()}…")
+
+    async def serve(self, transport, *, timeout: float = 60.0) -> None:
+        """Run the session over an `MdocTransport` until the reader ends it.
+
+        The counterpart to `mdoc_reader.run()`'s `async with link` block. Over
+        `mdoc_transport.loopback_pair()` this is a whole presentation with no
+        radio; over `mdoc_ble*` it would be a wallet, if one were advertising.
+        """
+        from mdoc_transport import TransportClosed
+
+        while not self.terminated:
+            try:
+                message = await transport.receive(timeout=timeout)
+            except TransportClosed:
+                self._log("transport closed by the reader")
+                return
+            reply = self.handle(message)
+            if reply is not None:
+                await transport.send(reply)
+
+    def _log(self, message: str) -> None:
+        if self._verbose:
+            print(f"[session] {message}")
