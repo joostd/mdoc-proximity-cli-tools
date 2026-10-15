@@ -54,12 +54,28 @@ def adb_path() -> str:
     raise QrError("adb not on PATH and not at the default Android SDK location")
 
 
+def screen_is_on(serial: str | None = None, *, adb: str | None = None) -> bool:
+    """Whether the handset's display is actually awake."""
+    command = [adb or adb_path()]
+    if serial:
+        command += ["-s", serial]
+    command += ["shell", "dumpsys", "power"]
+    completed = subprocess.run(command, capture_output=True, timeout=30)
+    return b"mWakefulness=Awake" in completed.stdout
+
+
 def uri_from_adb(serial: str | None = None, *, adb: str | None = None,
                  wait: float = 0.0, interval: float = 2.0) -> str:
     """Screencap the handset and decode whatever QR is on it.
 
     With `wait`, keep screencapping until a QR appears or the time runs out —
     so you can start the reader first and bring up the wallet screen after.
+
+    A screencap taken while the display is asleep returns the last frame that
+    was rendered, not a black one — so a QR from a *previous*, long-dead
+    engagement decodes perfectly and the whole session then fails against a
+    UUID nobody is advertising. Captures are only trusted while the screen is
+    awake.
     """
     command = [adb or adb_path()]
     if serial:
@@ -68,6 +84,13 @@ def uri_from_adb(serial: str | None = None, *, adb: str | None = None,
 
     deadline = time.monotonic() + wait
     while True:
+        if not screen_is_on(serial, adb=adb):
+            if time.monotonic() >= deadline:
+                raise QrError("the handset's screen is off — a screencap would "
+                              "return a stale frame, not a live engagement")
+            time.sleep(interval)
+            continue
+
         completed = subprocess.run(command, capture_output=True, timeout=30)
         if completed.returncode != 0:
             raise QrError(f"adb screencap failed: {completed.stderr.decode().strip()}")

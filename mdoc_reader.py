@@ -4,10 +4,11 @@ An ISO/IEC 18013-5 mdoc reader in Python: engagement + BLE + validation.
 
 Composes the verified modules:
 
-    mdoc_transcript  engagement parsing, SessionTranscript, session keys
-    mdoc_nfc         NFC static handover over PC/SC (optional)
-    mdoc_ble         GATT client transport (mdoc peripheral server mode)
-    mdoc_auth        issuer data authentication, value digests, mdoc auth
+    mdoc_transcript       engagement parsing, SessionTranscript, session keys
+    mdoc_nfc              NFC static handover over PC/SC (optional)
+    mdoc_ble              GATT client — mdoc peripheral server mode
+    mdoc_ble_peripheral   GATT server — mdoc central client mode
+    mdoc_auth             issuer data authentication, value digests, mdoc auth
 
 Usage:
     .venv/bin/python mdoc_reader.py 'mdoc:owBjMS4w...'
@@ -47,6 +48,7 @@ from mdoc_auth import (
     verify_value_digests,
 )
 from mdoc_transcript import (
+    ble_ident,
     build_session_transcript,
     derive_session_keys,
     encode_ereader_cose_key,
@@ -58,22 +60,46 @@ from mdoc_transcript import (
 )
 
 DEFAULT_DOC_TYPE = "eu.europa.ec.eudi.employee.1"
-DEFAULT_ELEMENTS = {"eu.europa.ec.eudi.employee.1": {"employee_id": False}}
+
+# docType -> (namespace, [data element identifiers])
+#
+# The namespace is NOT the docType in general. An mDL is docType
+# `org.iso.18013.5.1.mDL` but its elements live in namespace
+# `org.iso.18013.5.1` — assume they are the same and the wallet matches no
+# namespace, returning an empty document rather than an error.
+KNOWN_DOC_TYPES = {
+    "eu.europa.ec.eudi.employee.1": (
+        "eu.europa.ec.eudi.employee.1", ["employee_id"]),
+    "org.iso.18013.5.1.mDL": (
+        "org.iso.18013.5.1", ["family_name", "given_name", "birth_date",
+                              "document_number", "expiry_date"]),
+    "eu.europa.ec.eudi.pid.1": (
+        "eu.europa.ec.eudi.pid.1", ["family_name", "given_name", "birth_date"]),
+    "eu.europa.ec.eudi.pseudonym.age_over_18.1": (
+        "eu.europa.ec.eudi.pseudonym.age_over_18.1", ["age_over_18"]),
+}
 
 STATUS_TERMINATION = 20
 
 
-def build_device_request(doc_type: str, namespaces: dict) -> bytes:
+def build_device_request(requests: list[tuple[str, dict]]) -> bytes:
     """8.3.2.1.2.1 — unsigned DeviceRequest (no readerAuth).
+
+    `requests` is a list of (docType, nameSpaces). More than one is legal and
+    is the cheapest way to find out what a wallet holds: the mdoc returns a
+    Document for each docType it can satisfy and a documentError for the rest.
 
     Without readerAuth the wallet cannot tell who is asking, so it will warn
     the holder that the verifier is unidentified — and may refuse outright for
     data elements that require an authenticated reader.
     """
-    items_request = cbor2.dumps({"docType": doc_type, "nameSpaces": namespaces})
     return cbor2.dumps({
         "version": "1.0",
-        "docRequests": [{"itemsRequest": tag24(items_request)}],
+        "docRequests": [
+            {"itemsRequest": tag24(cbor2.dumps({"docType": doc_type,
+                                                "nameSpaces": namespaces}))}
+            for doc_type, namespaces in requests
+        ],
     })
 
 
@@ -92,6 +118,17 @@ def validate_response(device_response: dict, session_transcript: bytes,
     """Run every check 18013-5 requires of a reader, and report each one."""
     now = datetime.now(timezone.utc)
     all_ok = True
+
+    # 8.3.2.1.2.2 — the mdoc says so explicitly when it cannot answer a
+    # docRequest. Error 0 is "no such document"; the others are in Table 9.
+    for document_error in device_response.get("documentErrors", []):
+        for doc_type, code in document_error.items():
+            print(f"\nNot returned: {doc_type} — error {code}"
+                  + (" (the wallet holds no such document)" if code == 0 else ""))
+
+    if not device_response.get("documents"):
+        print("\nNo documents in the response.")
+        return False
 
     for document in device_response.get("documents", []):
         doc_type = document["docType"]
@@ -159,8 +196,42 @@ def validate_response(device_response: dict, session_transcript: bytes,
     return all_ok
 
 
-async def run(device_engagement_raw: bytes, doc_type: str, namespaces: dict,
+def choose_ble_mode(ble, preference: str) -> tuple[str, bytes]:
+    """8.3.3.1.1.1 — pick a transport mode and the UUID that goes with it.
+
+    When the mdoc offers both, the spec says the reader *should* select mdoc
+    central client mode, so that is what `auto` does. Each mode has its own
+    UUID in BleOptions (key 10 vs key 11); taking the wrong one means scanning
+    for, or advertising, a UUID nobody is using.
+    """
+    if preference == "auto":
+        if not (ble.central_client_mode or ble.peripheral_server_mode):
+            raise ValueError("the mdoc offers neither BLE mode")
+        preference = ("central-client" if ble.central_client_mode
+                      else "peripheral-server")
+
+    offered, uuid, key = (
+        (ble.central_client_mode, ble.central_client_uuid, 11)
+        if preference == "central-client" else
+        (ble.peripheral_server_mode, ble.peripheral_server_uuid, 10))
+
+    if not offered:
+        raise ValueError(f"the mdoc does not offer mdoc {preference.replace('-', ' ')} "
+                         "mode")
+    if not uuid:
+        raise ValueError(f"{preference} mode offered with no UUID (BleOptions {key})")
+    return preference, uuid
+
+
+MODE_DESCRIPTION = {
+    "peripheral-server": "mdoc peripheral server mode (we are the GATT client)",
+    "central-client": "mdoc central client mode (we are the GATT server)",
+}
+
+
+async def run(device_engagement_raw: bytes, requests: list[tuple[str, dict]],
               anchors: list, *, handover=None, service_uuid_override: bytes | None = None,
+              mode_override: str | None = None, ble_mode: str = "auto",
               require_chain: bool, dry_run: bool, verbose: bool,
               save: str | None = None) -> int:
     engagement = parse_device_engagement(device_engagement_raw)
@@ -169,20 +240,28 @@ async def run(device_engagement_raw: bytes, doc_type: str, namespaces: dict,
 
     if service_uuid_override is not None:
         # NFC static handover: the engagement carries no retrieval methods, so
-        # the transport comes from the NDEF Bluetooth LE OOB carrier instead.
-        service_uuid = mdoc_ble.service_uuid_str(service_uuid_override)
-        print(f"Transport: BLE, mdoc peripheral server mode, service {service_uuid} "
-              f"(from the NFC carrier)")
+        # the transport comes from the NDEF Bluetooth LE OOB carrier instead —
+        # its LE Role byte is the only statement of who is central.
+        mode = (ble_mode if ble_mode != "auto"
+                else mode_override or "peripheral-server")
+        uuid_bytes = service_uuid_override
+        source = " (from the NFC carrier)"
     else:
         if engagement.ble is None:
             print("No BLE retrieval method in this engagement.", file=sys.stderr)
             return 2
-        if not engagement.ble.reader_is_gatt_client:
-            print("Wallet wants mdoc central client mode; this reader only supports "
-                  "mdoc peripheral server mode (see mdoc_ble docstring).", file=sys.stderr)
+        try:
+            mode, uuid_bytes = choose_ble_mode(engagement.ble, ble_mode)
+        except ValueError as exc:
+            print(f"Cannot pick a BLE mode: {exc}", file=sys.stderr)
             return 2
-        service_uuid = mdoc_ble.service_uuid_str(engagement.ble.service_uuid)
-        print(f"Transport: BLE, mdoc peripheral server mode, service {service_uuid}")
+        offered = [name for name, on in
+                   (("peripheral server", engagement.ble.peripheral_server_mode),
+                    ("central client", engagement.ble.central_client_mode)) if on]
+        source = f" (mdoc offers: {', '.join(offered)})"
+
+    service_uuid = mdoc_ble.service_uuid_str(uuid_bytes)
+    print(f"Transport: BLE, {MODE_DESCRIPTION[mode]}, service {service_uuid}{source}")
 
     # Fresh ephemeral key per transaction — these are never reused (9.1.1.4).
     ereader_private = ec.generate_private_key(ec.SECP256R1())
@@ -194,27 +273,44 @@ async def run(device_engagement_raw: bytes, doc_type: str, namespaces: dict,
     print(f"SessionTranscript: {len(transcript)} bytes, SKReader "
           f"{keys['SKReader'][:8].hex()}…")
 
-    device_request = build_device_request(doc_type, namespaces)
+    device_request = build_device_request(requests)
     ciphertext = AESGCM(keys["SKReader"]).encrypt(
         session_nonce(1, reader=True), device_request, None)
     establishment = build_session_establishment(ereader_cose_key, ciphertext)
-    print(f"DeviceRequest: {len(device_request)} bytes -> SessionEstablishment "
+    print(f"DeviceRequest: {len(device_request)} bytes, "
+          f"{len(requests)} docRequest(s) -> SessionEstablishment "
           f"{len(establishment)} bytes")
+    for doc_type, namespaces in requests:
+        for namespace, elements in namespaces.items():
+            print(f"  asking {doc_type} / {namespace}: {', '.join(elements)}")
 
     if dry_run:
         print("\n--dry-run: not touching the radio. Request would be:")
         print(f"  {cbor2.loads(device_request)}")
         return 0
 
-    print(f"\nScanning for {service_uuid} …")
-    device = await mdoc_ble.find_mdoc(service_uuid)
-    if device is None:
-        print("Not found. The QR is single-use and the wallet stops advertising "
-              "when its engagement screen closes — rescan and retry.", file=sys.stderr)
-        return 1
-    print(f"Found {device.address} ({device.name or 'unnamed'})")
+    if mode == "central-client":
+        # We are the GATT server, so there is nothing to scan for: we
+        # advertise and the wallet comes to us. Ident is how it checks it
+        # reached the right reader (8.3.3.1.1.3).
+        import mdoc_ble_peripheral
+        ident = ble_ident(engagement.edevice_key_bytes)
+        print(f"\nAdvertising {service_uuid}, Ident {ident.hex()[:16]}… — "
+              "start the scan on the handset")
+        link_context = mdoc_ble_peripheral.MdocBlePeripheral(
+            service_uuid, ident, verbose=verbose)
+    else:
+        print(f"\nScanning for {service_uuid} …")
+        device = await mdoc_ble.find_mdoc(service_uuid)
+        if device is None:
+            print("Not found. The QR is single-use and the wallet stops advertising "
+                  "when its engagement screen closes — rescan and retry.",
+                  file=sys.stderr)
+            return 1
+        print(f"Found {device.address} ({device.name or 'unnamed'})")
+        link_context = mdoc_ble.MdocBleReader(device, service_uuid, verbose=verbose)
 
-    async with mdoc_ble.MdocBleReader(device, service_uuid, verbose=verbose) as link:
+    async with link_context as link:
         await link.send(establishment)
         print("Request sent. Waiting for the holder to consent on the handset…")
         raw = await link.receive()
@@ -262,7 +358,23 @@ def main() -> int:
                              "instead of scanning a QR")
     parser.add_argument("--nfc-reader", metavar="NAME",
                         help="substring of the PC/SC reader name to use")
-    parser.add_argument("--doc-type", default=DEFAULT_DOC_TYPE)
+    parser.add_argument("--doc-type", action="append", default=[], metavar="DOCTYPE",
+                        help="repeatable; one docRequest each. Known types: "
+                             + ", ".join(sorted(KNOWN_DOC_TYPES)))
+    parser.add_argument("--namespace", metavar="NS",
+                        help="namespace for an unknown --doc-type "
+                             "(only with a single --doc-type)")
+    parser.add_argument("--element", action="append", default=[], metavar="ID",
+                        help="data element to ask for; repeatable "
+                             "(only with a single --doc-type)")
+    parser.add_argument("--probe", action="store_true",
+                        help="ask for every known docType at once and report "
+                             "which ones the wallet holds")
+    parser.add_argument("--ble-mode", default="auto",
+                        choices=["auto", "central-client", "peripheral-server"],
+                        help="which side is the GATT server. auto follows the "
+                             "engagement, preferring mdoc central client mode "
+                             "when the mdoc offers both (8.3.3.1.1.1)")
     parser.add_argument("--trust-anchor", action="append", default=[], metavar="PEM",
                         help="IACA certificate; repeatable")
     parser.add_argument("--dry-run", action="store_true",
@@ -282,11 +394,27 @@ def main() -> int:
               "checked but NOT traced to a trusted IACA, so a valid result says "
               "nothing about who issued the credential.\n")
 
-    namespaces = (DEFAULT_ELEMENTS if args.doc_type == DEFAULT_DOC_TYPE
-                  else {args.doc_type: {}})
+    doc_types = args.doc_type or (sorted(KNOWN_DOC_TYPES) if args.probe
+                                  else [DEFAULT_DOC_TYPE])
+    if (args.namespace or args.element) and len(doc_types) != 1:
+        parser.error("--namespace / --element need exactly one --doc-type")
+
+    requests = []
+    for doc_type in doc_types:
+        known = KNOWN_DOC_TYPES.get(doc_type)
+        namespace = args.namespace or (known[0] if known else None)
+        elements = args.element or (known[1] if known else None)
+        if namespace is None or not elements:
+            parser.error(
+                f"{doc_type} is not in KNOWN_DOC_TYPES — give --namespace and at "
+                "least one --element. Note the namespace is often not the docType "
+                "(an mDL lives in org.iso.18013.5.1).")
+        # IntentToRetain false: we are reading, not storing (8.3.2.1.2.1).
+        requests.append((doc_type, {namespace: {e: False for e in elements}}))
 
     handover = None
     service_uuid_override = None
+    mode_override = None
 
     if args.nfc:
         import mdoc_nfc
@@ -298,17 +426,16 @@ def main() -> int:
         except mdoc_nfc.NfcError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        if not nfc.reader_is_gatt_client:
-            print(f"The handover offers LE role {nfc.le_role} (mdoc as central); "
-                  "this reader only supports mdoc peripheral server mode.",
-                  file=sys.stderr)
-            return 2
         if nfc.service_uuid is None:
-            print("The LE OOB carrier names no service UUID — nothing to scan for.",
+            print("The LE OOB carrier names no service UUID — no BLE carrier.",
                   file=sys.stderr)
             return 2
+        # The LE Role byte describes the *mdoc's* role, so it decides ours.
+        mode_override = ("peripheral-server" if nfc.reader_is_gatt_client
+                         else "central-client")
         print(f"NFC engagement: {len(nfc.handover_select)} byte Handover Select, "
-              f"{len(nfc.device_engagement_raw)} byte DeviceEngagement\n")
+              f"{len(nfc.device_engagement_raw)} byte DeviceEngagement, "
+              f"LE role {nfc.le_role}\n")
         device_engagement_raw = nfc.device_engagement_raw
         # 9.1.5.1 — the Handover Select goes into the transcript exactly as read;
         # the second element is null because this is a static handover.
@@ -334,9 +461,10 @@ def main() -> int:
             parser.error("give an mdoc: URI, or --from-image / --from-adb / --nfc")
         device_engagement_raw = parse_mdoc_uri(uri)
 
-    return asyncio.run(run(device_engagement_raw, args.doc_type, namespaces, anchors,
+    return asyncio.run(run(device_engagement_raw, requests, anchors,
                            handover=handover,
                            service_uuid_override=service_uuid_override,
+                           mode_override=mode_override, ble_mode=args.ble_mode,
                            require_chain=bool(anchors), dry_run=args.dry_run,
                            verbose=args.verbose, save=args.save))
 

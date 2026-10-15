@@ -26,8 +26,13 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.x509.oid import NameOID
 
 from mdoc_auth import build_device_authentication_bytes
-from mdoc_reader import validate_response
-from mdoc_transcript import build_session_transcript, encode_ereader_cose_key, tag24
+from mdoc_reader import choose_ble_mode, validate_response
+from mdoc_transcript import (
+    build_session_transcript,
+    encode_ereader_cose_key,
+    parse_device_engagement,
+    tag24,
+)
 
 DOC_TYPE = "eu.europa.ec.eudi.employee.1"
 NAMESPACE = DOC_TYPE
@@ -206,6 +211,49 @@ def main() -> int:
                              transcript)
     ok, _ = run_validation(impostor, transcript, [iaca])
     check("deviceSignature from an unbound key is rejected", not ok)
+
+    # --- BLE mode selection (8.3.3.1.1.1) -----------------------------------
+    #
+    # The two modes have separate UUIDs in BleOptions, so picking the mode and
+    # picking the UUID is one decision. Getting it wrong means advertising, or
+    # scanning for, a UUID nobody is using — which looks exactly like a wallet
+    # that never showed up.
+
+    peripheral_uuid, central_uuid = bytes(16), bytes(15) + b"\x01"
+
+    def ble(options):
+        return parse_device_engagement(cbor2.dumps({
+            0: "1.0",
+            1: [1, tag24(cbor2.dumps(_cose_key(device_key.public_key())))],
+            2: [[2, 1, options]],
+        })).ble
+
+    only_peripheral = ble({0: True, 1: False, 10: peripheral_uuid})
+    only_central = ble({0: False, 1: True, 11: central_uuid})
+    both = ble({0: True, 1: True, 10: peripheral_uuid, 11: central_uuid})
+
+    check("auto takes the only mode offered — peripheral server",
+          choose_ble_mode(only_peripheral, "auto")
+          == ("peripheral-server", peripheral_uuid))
+    check("auto takes the only mode offered — central client",
+          choose_ble_mode(only_central, "auto") == ("central-client", central_uuid))
+    # "the mdoc reader should select the mdoc central client mode" — 8.3.3.1.1.1.
+    check("auto prefers central client when both are offered",
+          choose_ble_mode(both, "auto") == ("central-client", central_uuid))
+    check("an explicit preference overrides that",
+          choose_ble_mode(both, "peripheral-server")
+          == ("peripheral-server", peripheral_uuid))
+
+    for engagement, preference, why in (
+            (only_central, "peripheral-server", "forcing a mode the mdoc lacks"),
+            (only_peripheral, "central-client", "forcing the other one"),
+            (ble({0: False, 1: False}), "auto", "an mdoc offering neither mode"),
+            (ble({0: True, 1: False}), "auto", "a mode offered with no UUID")):
+        try:
+            choose_ble_mode(engagement, preference)
+            check(f"rejected: {why}", False, "no error raised")
+        except ValueError as exc:
+            check(f"rejected: {why}", True, str(exc))
 
     print("\nALL PASS" if not _failures else f"\n{_failures} FAILURE(S)")
     return 1 if _failures else 0

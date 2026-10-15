@@ -54,18 +54,20 @@ class BleEngagement:
 
     @property
     def reader_is_gatt_client(self) -> bool:
-        """True when the mdoc is the GATT server and we connect to it.
+        """True when only mdoc peripheral server mode is on offer.
 
-        8.3.3.1.1.1: if the mdoc offers both modes the reader *should* select
-        mdoc central client mode — in which the reader is the GATT server and
-        must take the BLE peripheral role. That role is not available to
-        CoreBluetooth-backed Python on macOS.
+        When the mdoc offers both, 8.3.3.1.1.1 says the reader *should* choose
+        mdoc central client mode — and then the reader is the GATT server. That
+        is a policy decision rather than a fact about the engagement, so it
+        lives in `mdoc_reader.choose_ble_mode`; this property and `service_uuid`
+        below only report the unambiguous case.
         """
         return self.peripheral_server_mode and not self.central_client_mode
 
     @property
     def service_uuid(self) -> bytes | None:
-        return (self.peripheral_server_uuid if self.peripheral_server_mode
+        """The UUID for the mode this engagement unambiguously asks for."""
+        return (self.peripheral_server_uuid if self.reader_is_gatt_client
                 else self.central_client_uuid)
 
 

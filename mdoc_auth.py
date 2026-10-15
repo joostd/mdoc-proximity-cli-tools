@@ -25,8 +25,9 @@ from datetime import datetime, timezone
 
 import cbor2
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import ec, utils
+from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, rsa, utils
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 COSE_HEADER_X5CHAIN = 33
@@ -136,19 +137,60 @@ def verify_issuer_auth(
     return cbor2.loads(tagged.value)
 
 
+def _verify_certificate_signature(cert, issuer_public_key) -> None:
+    """Check one certificate's signature, whatever key its issuer uses.
+
+    18013-5 Annex B allows only ECDSA on P-256/384/521 in an mDL PKI, so it is
+    tempting to hardcode that — but test PKIs are routinely RSA, and an anchor
+    this code cannot *parse* must not be reported as an anchor that does not
+    *match*. `signature_algorithm_parameters` carries the padding for RSA and
+    the hash for ECDSA, so it handles PSS as well as PKCS#1 v1.5.
+    """
+    parameters = cert.signature_algorithm_parameters
+    if isinstance(issuer_public_key, ec.EllipticCurvePublicKey):
+        issuer_public_key.verify(cert.signature, cert.tbs_certificate_bytes,
+                                 parameters)
+    elif isinstance(issuer_public_key, rsa.RSAPublicKey):
+        issuer_public_key.verify(cert.signature, cert.tbs_certificate_bytes,
+                                 parameters, cert.signature_hash_algorithm)
+    elif isinstance(issuer_public_key, (ed25519.Ed25519PublicKey,
+                                        ed448.Ed448PublicKey)):
+        issuer_public_key.verify(cert.signature, cert.tbs_certificate_bytes)
+    else:
+        raise ValidationError(
+            f"unsupported trust anchor key type {type(issuer_public_key).__name__}")
+
+
 def _verify_chain_to_anchor(cert, trust_anchors) -> None:
+    """Chain the DS certificate to one of the configured IACAs.
+
+    Every rejection carries its reason. "Does not chain to any trust anchor"
+    on its own is the least useful message in this file: a DN mismatch, a bad
+    signature and a key type the verifier cannot handle are three very
+    different problems, and the last one is a bug in *this* code rather than a
+    fact about the credential.
+    """
+    if not trust_anchors:
+        raise ValidationError("no trust anchors configured")
+
+    reasons = []
     for anchor in trust_anchors:
+        name = anchor.subject.rfc4514_string()
         if cert.issuer != anchor.subject:
+            reasons.append(f"{name}: subject does not match the DS issuer DN")
             continue
         try:
-            anchor.public_key().verify(
-                cert.signature, cert.tbs_certificate_bytes,
-                ec.ECDSA(cert.signature_hash_algorithm))
+            _verify_certificate_signature(cert, anchor.public_key())
             return
-        except Exception:
-            continue
+        except ValidationError as exc:
+            reasons.append(f"{name}: {exc}")
+        except InvalidSignature:
+            reasons.append(f"{name}: DN matches but the signature does not verify")
+
+    detail = "; ".join(reasons)
     raise ValidationError(
-        f"DS certificate {cert.subject.rfc4514_string()!r} does not chain to any trust anchor")
+        f"DS certificate {cert.subject.rfc4514_string()!r} does not chain to any "
+        f"trust anchor ({detail})")
 
 
 def check_mso_validity(mso: dict, *, now: datetime | None = None) -> None:

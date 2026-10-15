@@ -228,26 +228,16 @@ def _transmit(connection, apdu: list[int], label: str) -> bytes:
     return bytes(data)
 
 
-def read_handover_select(*, reader_name: str | None = None, timeout: float = 60.0,
-                         verbose: bool = False) -> bytes:
-    """Wait for a tap, then read the Type 4 Tag's NDEF message."""
-    reader = _contactless_reader(reader_name)
-    log = (lambda m: print(f"[nfc] {m}")) if verbose else (lambda m: None)
-    log(f"reader: {reader}")
+def _read_ndef(connection, log) -> bytes:
+    """The Type 4 Tag read itself, from SELECT to the last READ BINARY."""
+    try:
+        _transmit(connection, SELECT_NDEF_APPLICATION, "SELECT NDEF application")
+    except NfcError as exc:
+        raise NfcError(
+            f"{exc}. Nothing is host-card-emulating the NDEF application "
+            f"({bytes(SELECT_NDEF_APPLICATION[5:12]).hex()}) — the handset has to "
+            "be unlocked, and a wallet has to be registered to handle it.") from exc
 
-    connection = reader.createConnection()
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            connection.connect()
-            break
-        except Exception:
-            if time.monotonic() >= deadline:
-                raise NfcError(f"nothing presented to the reader within {timeout:.0f}s")
-            time.sleep(0.4)
-    log("tag connected")
-
-    _transmit(connection, SELECT_NDEF_APPLICATION, "SELECT NDEF application")
     _transmit(connection, SELECT_CAPABILITY_CONTAINER, "SELECT capability container")
     cc = _transmit(connection, [0x00, 0xB0, 0x00, 0x00, 0x0F], "READ capability container")
 
@@ -277,11 +267,66 @@ def read_handover_select(*, reader_name: str | None = None, timeout: float = 60.
         offset += len(chunk)
 
     log(f"read {len(message)} bytes of NDEF")
-    try:
-        connection.disconnect()
-    except Exception:
-        pass
     return message
+
+
+def read_handover_select(*, reader_name: str | None = None, timeout: float = 60.0,
+                         verbose: bool = False) -> bytes:
+    """Wait for a tap, then read the Type 4 Tag's NDEF message.
+
+    A tap is not one event but a conversation: eight or so APDUs, over a link
+    that exists only while the handset is physically still. Lift it a
+    millimetre early and PC/SC fails the exchange with SCARD_E_NOT_TRANSACTED
+    (0x80100016) — the handset is fine, the wallet is fine, the read simply did
+    not finish. So an RF-level failure costs a retry rather than the run: keep
+    re-polling until the deadline and let the holder tap again.
+
+    A protocol-level answer is different. A status word the tag chose to send
+    is a real answer, and tapping again will produce the same one, so those
+    propagate immediately.
+    """
+    from smartcard.Exceptions import CardConnectionException
+
+    reader = _contactless_reader(reader_name)
+    log = (lambda m: print(f"[nfc] {m}")) if verbose else (lambda m: None)
+    log(f"reader: {reader}")
+
+    deadline = time.monotonic() + timeout
+    taps = 0
+    while True:
+        connection = reader.createConnection()
+        try:
+            connection.connect()
+        except Exception:
+            if time.monotonic() >= deadline:
+                raise NfcError(
+                    f"nothing presented to the reader within {timeout:.0f}s"
+                    + (f" ({taps} tap(s) dropped mid-read)" if taps else ""))
+            time.sleep(0.4)
+            continue
+
+        taps += 1
+        log(f"tag connected (tap {taps})")
+        try:
+            return _read_ndef(connection, log)
+        except CardConnectionException as exc:
+            log(f"tap {taps} dropped mid-read: {exc}")
+            if time.monotonic() >= deadline:
+                raise NfcError(
+                    f"the handset left the field before the read finished, "
+                    f"{taps} time(s) in {timeout:.0f}s. Either hold it flat "
+                    "against the reader until the engagement is printed, or "
+                    "more than one app is registered for the NDEF AID: Android "
+                    "then shows a 'Choose app to scan' dialog, and while it is "
+                    "up nothing answers the SELECT. Check with\n"
+                    "  adb shell dumpsys nfc | grep -B12 'AID: D2760000850101'"
+                ) from exc
+            time.sleep(0.4)
+        finally:
+            try:
+                connection.disconnect()
+            except Exception:
+                pass
 
 
 def engage(*, reader_name: str | None = None, timeout: float = 60.0,

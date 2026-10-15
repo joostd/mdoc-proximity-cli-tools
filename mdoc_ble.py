@@ -2,13 +2,14 @@
 """
 ISO/IEC 18013-5:2021 — BLE transport for an mdoc reader (8.3.3.1.1).
 
-Implements **mdoc peripheral server mode** only: the mdoc is the GATT server and
-we are the GATT client (BLE central). That is the role CoreBluetooth gives a
-Python process on macOS, and it is the mode the EUDI wallet offers.
+Implements **mdoc peripheral server mode**: the mdoc is the GATT server and we
+are the GATT client (BLE central). That is the mode the EUDI wallet offers, and
+the only one bleak can do — it is a central-only library.
 
-The other mode (mdoc central client) would make us the GATT *server* and BLE
-peripheral. bleak cannot do that at all, so a reader built on this module will
-only talk to wallets whose engagement sets BleOptions key 0 = true.
+The other mode (mdoc central client) makes us the GATT *server* and BLE
+peripheral. That lives in `mdoc_ble_peripheral`, which goes under bleak to
+CoreBluetooth directly. The two modules present the same interface, so
+`mdoc_reader` picks between them on the engagement alone.
 
 Framing, from 8.3.3.1.1.5 and 8.3.3.1.1.6:
 

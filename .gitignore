@@ -1,0 +1,11 @@
+eudi-app-android-wallet-ui
+eudi-app-multiplatform-verifier-ui
+iec.18013-5.2021.pdf
+
+# 148M of wallet builds
+apk/
+
+__pycache__/
+.venv/
+.DS_Store
+*.swp

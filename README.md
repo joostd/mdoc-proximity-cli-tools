@@ -8,8 +8,9 @@ takes a wallet's engagement, by QR or by NFC tap, negotiates a BLE session, and
 cryptographically validates the credential it receives. No Android verifier in
 the loop.
 
-Verified end to end against the EUDI reference wallet — over QR on 2026-10-13,
-over NFC on 2026-10-14:
+Verified end to end against two unrelated wallets: the EUDI reference wallet
+over QR on 2026-10-13 and over NFC on 2026-10-14, and wwWallet (`org.siros.id`)
+on 2026-10-14 in the opposite BLE role, where the reader is the GATT server.
 
 ```
 Document: eu.europa.ec.eudi.employee.1
@@ -26,7 +27,8 @@ VERIFIED
 ## Quick start
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install cbor2 cryptography bleak zxing-cpp pillow
+python3 -m venv .venv && .venv/bin/pip install cbor2 cryptography bleak zxing-cpp \
+    pillow pyscard pyobjc-framework-CoreBluetooth
 
 # offline: everything except the radio
 .venv/bin/python test_mdoc_auth.py
@@ -62,19 +64,20 @@ first, bring up the wallet screen second.
 |---|---|
 | `mdoc_transcript.py` | Engagement parsing, SessionTranscript, session key derivation |
 | `mdoc_ble.py` | GATT-client transport — scan, subscribe, `State=Start`, MTU−3 chunking |
+| `mdoc_ble_peripheral.py` | GATT-*server* transport, for mdoc central client mode |
 | `mdoc_auth.py` | Issuer data authentication, value digests, mdoc authentication |
 | `qr_engagement.py` | Lifts the `mdoc:` URI from a screenshot or a live `adb screencap` |
 | `mdoc_nfc.py` | NFC static handover — Type 4 Tag APDUs over PC/SC, NDEF parsing |
-| `mdoc_reader.py` | The driver that composes all five |
+| `mdoc_reader.py` | The driver that composes all six |
 
-### Tests — 73 checks, all passing
+### Tests — 84 checks, all passing
 
 | File | Checks | Against what |
 |---|---|---|
 | `d51_session_encryption_test.py` | 5 | Annex D.5.1 — ECDH, HKDF, AES-256-GCM |
 | `test_mdoc_transcript.py` | 17 | A real captured session, byte-for-byte |
-| `test_mdoc_auth.py` | 18 | Annex D.5.2 and D.5.3 vectors, plus negative cases |
-| `test_mdoc_reader.py` | 6 | A synthetic credential minted in-process |
+| `test_mdoc_auth.py` | 21 | Annex D.5.2 and D.5.3 vectors, plus negative cases |
+| `test_mdoc_reader.py` | 14 | A synthetic credential minted in-process, plus BLE mode choice |
 | `test_mdoc_nfc.py` | 27 | The Annex D.5.1 handover, plus a Handover Select read off the wallet |
 
 ```sh
@@ -95,6 +98,8 @@ do .venv/bin/python $t.py; done
 | `eudi-preprod-iaca.pem` | EUDI preprod IACA root, for `--trust-anchor` |
 | `live-response.cbor` | A captured DeviceResponse with its SessionTranscript (QR) |
 | `nfc-response.cbor` | The same, from the NFC run — note the 2-element Handover |
+| `siros-mdl.cbor` | An mDL from wwWallet, read in mdoc central client mode |
+| `inspect_response.py` | Prints the x5chain, MSO validity and disclosed elements of a `--save` artifact |
 
 The three symlinks point at the two EUDI repositories and the spec PDF.
 
@@ -132,6 +137,19 @@ Three checks make a verified credential:
 3. **mdoc authentication** — `deviceSignature` (or `deviceMac`) proves the
    holder controls the key the MSO names, signed over *this* session's
    transcript. This is what makes a captured response useless in a replay.
+
+What those three checks do *not* cover is worth saying plainly. All three
+passed on the wwWallet mDL, which had asked for 5 data elements and returned
+27 — including the portrait and a `pseudonym_seed`. Selective disclosure is
+enforced by the holder and by nothing else in the protocol: a verifier cannot
+tell an over-sharing wallet from a well-behaved one, because the extra
+elements carry perfectly valid digests. Nor do the checks say anything about
+provenance. That mDL claims `issuing_authority = 'SUNET'` and
+`issuing_country = 'SE'` in its payload, while its actual document signer is
+`CN=E2E Test Credential Signer` under a self-signed `E2E Test Root CA`, SAN
+`https://sirosid-yitbarek-vc-apigw.fly.dev`. The payload is a claim; the
+certificate chain is the evidence, and only an out-of-band IACA makes the
+difference visible — which is the whole argument for `--trust-anchor`.
 
 ### Two ways in: QR and NFC
 
@@ -180,7 +198,49 @@ The Annex D.5.1 vector happens to be a negotiated handover, which makes it a
 useful second fixture: `test_mdoc_nfc.py` parses its Handover Select and
 rebuilds the published `SessionTranscriptBytes` byte for byte.
 
-### Five things that will cost you an afternoon
+### Both BLE modes, and why the second one needs no bleak
+
+18013-5 defines two BLE arrangements, and a conformant reader must support both
+(clause 549). They differ only in who is the GATT server:
+
+| | mdoc peripheral server mode | mdoc central client mode |
+|---|---|---|
+| mdoc is | GATT server, BLE peripheral | GATT client, BLE central |
+| reader is | GATT client, BLE central | GATT server, BLE peripheral |
+| characteristics | Table 11, `0x0001`–`0x0003` | Table 12, `0x0005`–`0x0008` |
+| `Ident` | absent | present — served by the **reader** |
+| engagement | BleOptions `0: true`, UUID in `10` | BleOptions `1: true`, UUID in `11` |
+| module | `mdoc_ble.py` | `mdoc_ble_peripheral.py` |
+
+When a wallet offers both, 8.3.3.1.1.1 says the reader *should* choose central
+client mode, which is what `--ble-mode auto` does. `choose_ble_mode` makes that
+one decision, because the mode also decides which UUID to use: take the wrong
+key out of BleOptions and you advertise a UUID nobody is looking for, which
+looks exactly like a wallet that never appeared.
+
+bleak cannot be a peripheral — it is a central-only library — so the second
+mode goes under it to `CBPeripheralManager` through PyObjC. The role *is*
+available to a Python process on macOS; it just is not available through bleak.
+CoreBluetooth delivers its callbacks on a dispatch queue, so every one of them
+hops back to the event loop with `call_soon_threadsafe`.
+
+The EUDI reference wallet offers peripheral server mode; `org.siros.id`
+(wwWallet in a native Android shell) offers central client mode only. Having
+both is the difference between reading one wallet and reading wallets — siros
+was verified on 2026-10-14, an `org.iso.18013.5.1.mDL` with 27 elements.
+
+Two things make a live central-client session harder to land than the mode
+itself. siros scans for a reader for **20 seconds** and then gives up, and it
+regenerates its engagement — a new QR and a new service UUID — on every retry,
+so the QR must be read from the *current* attempt. Worse, `adb screencap`
+returns the last rendered frame when the display is asleep, so a QR from a
+long-dead engagement decodes perfectly and the session then fails against a
+UUID nobody is advertising. `qr_engagement.screen_is_on` now refuses a capture
+unless the handset is awake; the reliable choreography is to wait for
+`ProximityBridge: Proximity session started in CENTRAL mode` in logcat and
+screencap a second later.
+
+### Seven things that will cost you an afternoon
 
 **The transcript must carry the QR bytes verbatim.** `DeviceEngagementBytes` is
 the exact byte string that came off the QR. Decoding it to a dict and
@@ -198,7 +258,9 @@ wrapping steps that are easy to collapse into one. Same silent GCM failure.
 **`Ident` is not where you'd guess.** Table 11 (mdoc as GATT server — the
 common case) has no `Ident` characteristic at all. It exists only in Table 12,
 where the *reader* is the GATT server, and it is served by the reader and read
-by the mdoc, not the other way round.
+by the mdoc, not the other way round. It is `HKDF(EDeviceKeyBytes, info =
+"BLEIdent")` — derived from the *mdoc's* ephemeral key, which is the point:
+only something that saw the engagement can compute it.
 
 **The service UUID in an NFC carrier is little-endian.** Bluetooth AD type
 `0x07` lists 128-bit UUIDs least-significant byte first, so the carrier bytes
@@ -207,6 +269,46 @@ by the mdoc, not the other way round.
 will find nothing, with no hint as to why. The same payload's LE Role byte
 describes the **mdoc's** role, not the reader's: `0x00`, peripheral only, means
 mdoc peripheral server mode and so the reader is the GATT client.
+
+**Two wallets on one handset break NFC, silently.** AID `D2760000850101` is
+*the* NDEF application — every mdoc wallet registers it, in HCE category
+`other`, where Android has no notion of a default. Install a second wallet and
+every tap raises a "Choose app to scan" dialog instead of answering; while it
+is up nothing responds to the SELECT, the RF session dies, and PC/SC reports
+`SCARD_E_NOT_TRANSACTED (0x80100016)` — a transport error for what is really a
+routing conflict. Identical symptom to lifting the handset too early, which is
+why it is worth checking before blaming your hand:
+
+```sh
+adb shell dumpsys nfc | grep -B12 'AID: D2760000850101'
+```
+
+There is no reader-side fix. `CardEmulation.setPreferredService()` pre-empts
+routing only for an app in the foreground, which a verifier on a Mac is not, so
+the only cure is to leave exactly one claimant installed. From `adb shell` that
+has to be done at *package* granularity — the obvious component-level form is
+refused on a production build:
+
+```
+$ pm disable-user --user 0 org.siros.wwwallet/…MdocHostApduService
+SecurityException: Shell cannot change component state for ComponentInfo{…} to 3
+$ pm disable-user --user 0 org.siros.wwwallet        # this one works
+Package org.siros.wwwallet new state: disabled-user  # pm enable to undo
+```
+
+With the other two wallets disabled the tap verified first try, on 2026-10-15:
+204-byte Handover Select, 380-byte SessionTranscript, `VERIFIED`.
+
+The QR path is unaffected: it does not go through AID routing at all.
+
+**Don't assume the PKI is ECDSA.** Annex B says an mDL PKI uses ECDSA on
+P-256/384/521, so building an `ec.ECDSA` verifier for every trust anchor looks
+safe. Test PKIs are routinely RSA — wwWallet's root is — and the RSA anchor
+then raised inside a `try` whose `except Exception: continue` turned it into
+"does not chain to any trust anchor". `openssl verify` accepted the same
+chain. A verifier that cannot parse an anchor must not report it as an anchor
+that does not match: the first is a bug here, the second is a fact about the
+credential, and conflating them sends you looking in the wrong place.
 
 **Don't look characteristics up by UUID alone.** Every transaction gets a fresh
 *service* UUID but reuses the same three *characteristic* UUIDs, and macOS
@@ -219,10 +321,9 @@ Start write into a dead service and a silent hang.
 
 ## Limitations
 
-- **mdoc peripheral server mode only.** The reader is a BLE central / GATT
-  client. The other mode would make it a BLE peripheral, which CoreBluetooth
-  does not offer a Python process. A conformant mDL reader must support both;
-  this one talks only to wallets whose engagement sets BleOptions key `0`.
+- **Only the BLE transport.** Clause 549 requires a conformant mDL reader to
+  support both BLE modes, which this one now does, but 18013-5 also defines
+  NFC and Wi-Fi Aware data retrieval. Neither is implemented.
 - **No reader authentication.** The `DeviceRequest` carries no `readerAuth`, so
   the wallet cannot tell who is asking and will say so. Fixing this needs a
   reader certificate the wallet's trust list recognises.

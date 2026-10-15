@@ -14,16 +14,18 @@ Annex D vector covers but which is what the live 2026-10-13 capture used.
 Run:  .venv/bin/python test_mdoc_auth.py
 """
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import cbor2
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import ec, utils
+from cryptography.hazmat.primitives.asymmetric import ec, rsa, utils
+from cryptography.x509.oid import NameOID
 
 import _vectors_annex_d as v
 from mdoc_auth import (
     ValidationError,
+    _verify_chain_to_anchor,
     build_device_authentication_bytes,
     check_mso_validity,
     derive_emac_key,
@@ -62,6 +64,32 @@ def raises(label, exc_type, fn, *args, **kwargs):
         check(label, False, "accepted when it should have been rejected")
 
 
+def _name(common_name: str) -> x509.Name:
+    return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+
+
+def _certificate(subject, subject_key, issuer, issuer_key, *, ca: bool):
+    now = datetime.now(timezone.utc)
+    builder = (x509.CertificateBuilder()
+               .subject_name(subject).issuer_name(issuer)
+               .public_key(subject_key.public_key())
+               .serial_number(x509.random_serial_number())
+               .not_valid_before(now - timedelta(days=1))
+               .not_valid_after(now + timedelta(days=365))
+               .add_extension(x509.BasicConstraints(ca=ca, path_length=None),
+                              critical=True))
+    return builder.sign(issuer_key, hashes.SHA256())
+
+
+def _self_signed(key, common_name: str):
+    return _certificate(_name(common_name), key, _name(common_name), key, ca=True)
+
+
+def _issued_by(issuer_key, issuer_name, subject_key, common_name: str):
+    return _certificate(_name(common_name), subject_key, issuer_name, issuer_key,
+                        ca=False)
+
+
 def main() -> int:
     iaca = x509.load_der_x509_certificate(v.IACA_DER)
 
@@ -85,6 +113,38 @@ def main() -> int:
         cbor2.loads(v.ISSUER_AUTH)[1][33])
     raises("unknown trust anchor rejected", ValidationError,
            verify_issuer_auth, v.ISSUER_AUTH, [unrelated], now=AS_OF)
+
+    # --- an RSA trust anchor -------------------------------------------------
+    #
+    # Annex B says an mDL PKI is ECDSA on P-256/384/521, and the verifier used
+    # to assume it: it built an `ec.ECDSA` verifier for every anchor, so an RSA
+    # root raised, got swallowed by a bare `except Exception`, and was reported
+    # as "does not chain to any trust anchor". Test PKIs are routinely RSA
+    # (wwWallet's is), and openssl verifying a chain this code rejects is the
+    # worst kind of disagreement — it points the blame at the credential.
+
+    rsa_root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rsa_root = _self_signed(rsa_root_key, "RSA Test Root CA")
+    ds_key = ec.generate_private_key(ec.SECP256R1())
+    ds_cert = _issued_by(rsa_root_key, rsa_root.subject, ds_key, "DS under an RSA root")
+
+    _verify_chain_to_anchor(ds_cert, [rsa_root])
+    check("an EC document signer chains to an RSA root", True,
+          f"{ds_cert.signature_algorithm_oid._name} verified")
+
+    other_rsa_root = _self_signed(
+        rsa.generate_private_key(public_exponent=65537, key_size=2048),
+        "RSA Test Root CA")  # same DN, different key
+    raises("a same-DN RSA root with the wrong key is rejected", ValidationError,
+           _verify_chain_to_anchor, ds_cert, [other_rsa_root])
+
+    try:
+        _verify_chain_to_anchor(ds_cert, [iaca])
+    except ValidationError as exc:
+        check("the rejection names the anchor and the reason",
+              "subject does not match" in str(exc)
+              and iaca.subject.rfc4514_string() in str(exc),
+              str(exc))
 
     # A single flipped byte in the signature must break verification.
     tampered = list(cbor2.loads(v.ISSUER_AUTH))
