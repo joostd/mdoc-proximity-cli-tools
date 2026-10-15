@@ -220,6 +220,18 @@ def validate_response(device_response: dict, session_transcript: bytes,
         for element in elements:
             print(f"      {element.namespace}/{element.identifier} = {element.value!r}")
 
+        # 8.3.2.1.2.2 — per-element errors, the mdoc's account of what it
+        # could not give us. Printed, never checked: `errors` lives outside
+        # issuerSigned and outside DeviceAuthentication, so it is signed by
+        # nobody. An mdoc can claim not to hold an element it is simply
+        # withholding, and a reader has no way to tell.
+        for namespace, codes in document.get("errors", {}).items():
+            for identifier, code in codes.items():
+                reason = ("the mdoc holds no such element" if code == 0
+                          else f"error {code}")
+                print(f"      {namespace}/{identifier} — not returned, "
+                      f"{reason} (unsigned)")
+
     return all_ok
 
 

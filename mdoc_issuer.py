@@ -24,6 +24,7 @@ Requires: cbor2, cryptography
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import secrets
 from dataclasses import dataclass, field
@@ -227,6 +228,25 @@ def mint(
                       device_private_key=device_private_key), pki
 
 
+# 60x80 greyscale silhouette, 532 bytes. `portrait` is mandatory in Table 5,
+# and `b"\xff\xd8\xff\xd9"` satisfies the schema while decoding to nothing —
+# fine between our own two halves, useless in front of a verifier UI that
+# tries to draw it. Pass this to `sample_mdl_elements` when something else is
+# going to read the credential; `mdoc_wallet` does.
+PLACEHOLDER_PORTRAIT = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABQODxIPDRQSEBIXFRQYHjIhHhwcHj0sLiQy"
+    "SUBMS0dARkVQWnNiUFVtVkVGZIhlbXd7gYKBTmCNl4x9lnN+gXz/2wBDARUXFx4aHjsh"
+    "ITt8U0ZTfHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8"
+    "fHx8fHz/wAARCABQADwDASIAAhEBAxEB/8QAGgABAAMBAQEAAAAAAAAAAAAAAAIEBQMB"
+    "Bv/EACQQAAMAAgIBBAIDAAAAAAAAAAABAgMRBCFhEjFBUSIyM3LR/8QAFgEBAQEAAAAA"
+    "AAAAAAAAAAAAAAEC/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8A+iAB"
+    "pAA51yMUPVWt+OwOgIxkjItxSZIAAAAAAr8vK8cJT06+SgXubjdQqXfp9yiBLHkrHSqX"
+    "2ak0qlUvZrZlTLulMrbZqxPpiZ3vS0B6AAAAbSW30gBwriYqe+58I45+W6/HFtL5f2Vm"
+    "3T3Tbf2wNLFhjF+q7+2dDKjJeP8ASmvBewcmcv4vq/r7A7gAAVeblcpY52m+2/BaMvNX"
+    "qzW9779wIAAIHs04pVL00eADUxWsmNWlrfwTKnArq535SLYUMg1zKyz6MtTrST6AiAAg"
+    "AALPB/mf9f8AC8U+BPd1rwmXAr//2Q==")
+
+
 def sample_mdl_elements(*, portrait: bytes = b"\xff\xd8\xff\xd9") -> dict:
     """The mandatory mDL data elements from 7.2.1 Table 5.
 
@@ -234,7 +254,8 @@ def sample_mdl_elements(*, portrait: bytes = b"\xff\xd8\xff\xd9") -> dict:
     birth date is a calendar day, not an instant, and encoding it as a
     date-time would imply a timezone the credential does not have. The default
     `portrait` is an empty JPEG, since a real one is 10-20 kB and would make
-    every fixture in this repo tedious to read.
+    every fixture in this repo tedious to read; `PLACEHOLDER_PORTRAIT` above
+    is a real one for when a real verifier is looking.
     """
     return {MDL_NAMESPACE: {
         "family_name": "Mustermann",

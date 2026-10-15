@@ -32,7 +32,7 @@ VERIFIED
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install cbor2 cryptography bleak zxing-cpp \
-    pillow pyscard pyobjc-framework-CoreBluetooth
+    pillow pyqrcode pyscard pyobjc-framework-CoreBluetooth
 
 # offline: everything except the radio
 .venv/bin/python test_mdoc_auth.py
@@ -67,9 +67,11 @@ Pi does, a Mac does not — because a Mac cannot see its own advertisement:
 ```sh
 # on the Pi: cbor2 and cryptography, plus the system dbus-python and pygobject
 pi$  python3 -m venv --system-site-packages .venv
-pi$  .venv/bin/pip install cbor2 cryptography
+pi$  .venv/bin/pip install cbor2 cryptography pyqrcode
 pi$  .venv/bin/python mdoc_wallet.py --save-anchor iaca.pem --reuse-pki pki.pem -v
      mdoc:owBjMS4wAYIB2BhYS6QBAiABIVgg…
+     (and the same engagement as a QR, for a verifier app's camera — give
+      the window 106 columns, or it falls back to a half-height one)
 
 # on the Mac: the IACA has to travel out of band, exactly as a trust list would
 mac$ scp pi:iaca.pem .
@@ -91,7 +93,7 @@ and `--disclosure everything` makes it the over-sharing wallet below.
 | `mdoc_ble.py` | GATT-client transport — scan, subscribe, `State=Start`, MTU−3 chunking |
 | `mdoc_ble_peripheral.py` | GATT-*server* transport, for mdoc central client mode |
 | `mdoc_auth.py` | Issuer data authentication, value digests, mdoc authentication |
-| `qr_engagement.py` | Lifts the `mdoc:` URI from a screenshot or a live `adb screencap` |
+| `qr_engagement.py` | Lifts the `mdoc:` URI off a screenshot or a live `adb screencap` — and draws one, for when we are the wallet |
 | `mdoc_nfc.py` | NFC static handover — Type 4 Tag APDUs over PC/SC, NDEF parsing |
 | `mdoc_reader.py` | The driver that composes the rest |
 

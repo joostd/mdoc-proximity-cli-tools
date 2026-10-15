@@ -13,6 +13,9 @@ halves of 18013-5 meet over a real radio:
 
     pi$  python3 mdoc_wallet.py --save-anchor iaca.pem
          mdoc:owBjMS4wAYIB2BhYS6QBAiABIVgg...
+         ███████  █ ██ █  ███████      (and the same thing as a QR, for a
+         █     █  ██  ██  █     █       verifier app that wants to scan it;
+         █ ███ █  ██ ███  █ ███ █       needs a 106-column window)
 
     mac$ scp joostd@raspberrypi.local:iaca.pem .
     mac$ .venv/bin/python mdoc_reader.py 'mdoc:owBjMS4w...' --trust-anchor iaca.pem
@@ -40,7 +43,13 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
 from mdoc_holder import DeviceAuth, Disclosure, HolderSession, MdocHolder
-from mdoc_issuer import Pki, generate_pki, mint, sample_mdl_elements
+from mdoc_issuer import (
+    PLACEHOLDER_PORTRAIT,
+    Pki,
+    generate_pki,
+    mint,
+    sample_mdl_elements,
+)
 from mdoc_transport import service_uuid_str
 
 
@@ -86,7 +95,10 @@ def load_or_make_pki(path: Path | None):
 
 async def serve_once(args) -> int:
     pki = load_or_make_pki(Path(args.reuse_pki) if args.reuse_pki else None)
-    credential, _ = mint(sample_mdl_elements(), pki=pki)
+    # A decodable portrait, unlike the repo's fixture default: this credential
+    # is meant to be read by something that will try to draw it.
+    credential, _ = mint(
+        sample_mdl_elements(portrait=PLACEHOLDER_PORTRAIT), pki=pki)
 
     if args.save_anchor:
         Path(args.save_anchor).write_bytes(
@@ -107,6 +119,24 @@ async def serve_once(args) -> int:
     print(f"Disclosure policy: {args.disclosure}, "
           f"{'deviceMac' if args.device_mac else 'deviceSignature'}")
     print(f"\nEngagement — give this to the reader:\n\n{session.uri}\n")
+
+    if args.qr:
+        # A verifier app has a camera, not a clipboard. Drawn here rather than
+        # on the machine you are sitting at, so there is nothing to copy and
+        # no window to find: ssh in, and the QR is already on your screen.
+        import shutil
+
+        from qr_engagement import qr_terminal, qr_terminal_width
+
+        needed = qr_terminal_width(session.uri)
+        if shutil.get_terminal_size().columns < needed:
+            # Say so rather than quietly drawing the squashed one: oblong
+            # modules look fine to a human and scan badly, which is the worst
+            # way for this to fail.
+            print(f"(widen this window to {needed} columns for square "
+                  f"modules — drawing the compact QR instead)\n")
+        print(qr_terminal(session.uri))
+        print()
 
     if args.dry_run:
         print("--dry-run: stopping before the radio.")
@@ -159,6 +189,9 @@ def main() -> int:
                         help="how long to advertise before giving up")
     parser.add_argument("--timeout", type=float, default=60.0, metavar="SECONDS",
                         help="how long to wait for each message once connected")
+    parser.add_argument("--no-qr", dest="qr", action="store_false",
+                        help="skip the QR — it is 53 lines of ANSI escapes, "
+                             "which is not what you want in a log file")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the engagement and stop before the radio")
     parser.add_argument("-v", "--verbose", action="store_true",

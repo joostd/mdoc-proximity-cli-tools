@@ -154,6 +154,37 @@ async def main() -> int:
           and parse_mdoc_uri(probe.uri) == probe.engagement_raw,
           probe.uri[:48] + "…")
 
+    # The QR is how this URI reaches a verifier that is not us, so the
+    # encoder is checked against the decoder that has been reading wallets'
+    # screens since the start — the same pairing as parser and generator.
+    import re
+
+    from qr_engagement import _decode, _padded, qr_image, qr_modules, qr_terminal
+
+    check("and survives being drawn as a QR and read back",
+          _decode(qr_image(probe.uri)) == probe.uri,
+          f"{len(probe.uri)} characters, "
+          f"{qr_image(probe.uri, scale=1, quiet_zone=0).width} modules square")
+
+    # The terminal renderings get no such round trip — nothing here can scan a
+    # screen — so they are checked by reading the colours back out. A renderer
+    # that loses a row still looks like a QR to a human and to no camera.
+    want = _padded(qr_modules(probe.uri), 2)
+    wide = [[colour == "16" for colour in re.findall(r"\033\[48;5;(\d+)m  ", line)]
+            for line in qr_terminal(probe.uri, compact=False).splitlines()]
+    pairs = [re.findall(r"\033\[38;5;(\d+)m\033\[48;5;(\d+)m▀", line)
+             for line in qr_terminal(probe.uri, compact=True).splitlines()]
+    compact = [[cell[half] == "16" for cell in line]
+               for line in pairs for half in (0, 1)]
+
+    check("the terminal QR is two cells per module, so it is square",
+          wide == want,
+          f"{len(wide)} lines of {len(wide[0])} cells, "
+          f"{len(want)} modules including the quiet zone")
+    check("and the compact one packs two rows per line without losing any",
+          compact[:len(want)] == want,
+          "half the lines, same modules — square only if the cell is 2:1")
+
     parsed = parse_device_engagement(probe.engagement_raw)
     check("it round trips through this repo's own parser",
           parsed.version == "1.0" and parsed.cipher_suite == 1

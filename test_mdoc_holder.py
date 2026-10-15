@@ -105,6 +105,28 @@ def main() -> int:
     names = sorted(cbor2.loads(i.value)["elementIdentifier"] for i in disclosed)
     check("the holder discloses exactly what was asked",
           names == ["birth_date", "family_name"], ", ".join(names))
+    check("and reports no errors when it held everything asked for",
+          "errors" not in decoded["documents"][0])
+
+    # --- elements the credential does not have -------------------------------
+
+    mixed = build_device_request([(MDL_DOC_TYPE, {MDL_NAMESPACE: {
+        "family_name": False, "age_over_18": False, "height": False}})])
+    mixed_document = cbor2.loads(holder.respond(mixed, transcript))["documents"][0]
+    opened = [cbor2.loads(i.value)["elementIdentifier"]
+              for i in mixed_document["issuerSigned"]["nameSpaces"][MDL_NAMESPACE]]
+    check("an element the mdoc does not hold becomes a Table 8 error",
+          mixed_document.get("errors") == {MDL_NAMESPACE:
+                                           {"age_over_18": 0, "height": 0}},
+          f"disclosed {opened}, errors {sorted(mixed_document.get('errors', {}).get(MDL_NAMESPACE, {}))}")
+    check("the elements it does hold come back alongside",
+          opened == ["family_name"])
+
+    ok, report = verify(cbor2.dumps({"version": "1.0", "status": 0,
+                                     "documents": [mixed_document]}),
+                        transcript, anchors)
+    check("and a response carrying errors still verifies", ok,
+          "`errors` sits outside issuerSigned, so it changes no digest")
 
     ok, report = verify(response, transcript, anchors)
     check("the reader verifies a credential this repo issued", ok,
@@ -133,6 +155,10 @@ def main() -> int:
                        ["documents"][0]["issuerSigned"]["nameSpaces"][MDL_NAMESPACE])
     check("an over-sharing holder returns 11 elements for a 2-element request",
           greedy_count == 11, f"{greedy_count} returned")
+    check("a holder not answering the question claims no missing elements",
+          "errors" not in cbor2.loads(greedy.respond(mixed, transcript))
+                               ["documents"][0],
+          "'not found' would be a lie about an element it is withholding")
 
     ok, report = verify(greedy_response, transcript, anchors)
     check("and the reader still reports VERIFIED — selective disclosure is "

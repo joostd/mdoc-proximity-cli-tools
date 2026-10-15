@@ -65,6 +65,11 @@ STATUS_GENERAL_ERROR = 10
 # Table 9 — documentErrors. 0 means the mdoc holds no such document.
 ERROR_DOCUMENT_NOT_FOUND = 0
 
+# 8.3.2.1.2.2 — the per-element `errors` map inside a Document. 0 means the
+# mdoc does not have this element. Distinct from declining to disclose one,
+# which the spec gives the holder no way to say at all.
+ERROR_ELEMENT_NOT_FOUND = 0
+
 
 class HolderError(Exception):
     pass
@@ -206,6 +211,28 @@ class MdocHolder:
                 disclosed[namespace] = kept
         return disclosed
 
+    def _missing(self, credential: Credential, request: DocRequest) -> dict:
+        """Requested elements this credential does not have, as Table 8 errors.
+
+        Only honest under `Disclosure.REQUESTED`. Under the other two policies
+        what came back has nothing to do with what was asked for, and claiming
+        "not found" for an element we are simply withholding would be a lie —
+        a distinction the spec gives the holder no vocabulary for, so the
+        right move is to say nothing.
+        """
+        if self._disclosure is not Disclosure.REQUESTED:
+            return {}
+
+        errors = {}
+        for namespace, wanted in request.namespaces.items():
+            held = {cbor2.loads(item.value)["elementIdentifier"]
+                    for item in credential.namespaces.get(namespace, [])}
+            absent = {element: ERROR_ELEMENT_NOT_FOUND
+                      for element in wanted if element not in held}
+            if absent:
+                errors[namespace] = absent
+        return errors
+
     # --- device authentication ---------------------------------------------
 
     def _device_signature(self, credential: Credential, session_transcript: bytes,
@@ -286,16 +313,19 @@ class MdocHolder:
                 continue
 
             disclosed = self._disclose(credential, request)
+            missing = self._missing(credential, request)
             opened = sum(len(items) for items in disclosed.values())
+            absent = sum(len(items) for items in missing.values())
             self._log(f"{request.doc_type}: asked {request.element_count}, "
-                      f"disclosing {opened} ({self._disclosure.value}), "
-                      f"{self._device_auth.value}")
+                      f"disclosing {opened} ({self._disclosure.value})"
+                      + (f", {absent} not held" if absent else "")
+                      + f", {self._device_auth.value}")
 
             # DeviceNameSpaces is empty: these are elements the *device*
             # asserts rather than the issuer, and this holder has none. It is
             # still signed over, so it cannot be stripped.
             device_namespaces_raw = cbor2.dumps({})
-            documents.append({
+            document = {
                 "docType": credential.doc_type,
                 "issuerSigned": {
                     "nameSpaces": disclosed,
@@ -307,7 +337,14 @@ class MdocHolder:
                         credential, session_transcript, device_namespaces_raw,
                         ereader_public),
                 },
-            })
+            }
+            # `errors` sits outside issuerSigned, and so outside everything the
+            # issuer signed and everything mdoc authentication covers. It is
+            # the mdoc talking about itself, and a reader must treat it as a
+            # hint, not as evidence.
+            if missing:
+                document["errors"] = missing
+            documents.append(document)
 
         response = {"version": "1.0", "status": STATUS_OK}
         if documents:
