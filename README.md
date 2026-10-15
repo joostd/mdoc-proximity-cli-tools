@@ -63,14 +63,15 @@ first, bring up the wallet screen second.
 | File | Role |
 |---|---|
 | `mdoc_transcript.py` | Engagement parsing, SessionTranscript, session key derivation |
+| `mdoc_transport.py` | The `MdocTransport` contract, plus a radio-free loopback link |
 | `mdoc_ble.py` | GATT-client transport — scan, subscribe, `State=Start`, MTU−3 chunking |
 | `mdoc_ble_peripheral.py` | GATT-*server* transport, for mdoc central client mode |
 | `mdoc_auth.py` | Issuer data authentication, value digests, mdoc authentication |
 | `qr_engagement.py` | Lifts the `mdoc:` URI from a screenshot or a live `adb screencap` |
 | `mdoc_nfc.py` | NFC static handover — Type 4 Tag APDUs over PC/SC, NDEF parsing |
-| `mdoc_reader.py` | The driver that composes all six |
+| `mdoc_reader.py` | The driver that composes the rest |
 
-### Tests — 84 checks, all passing
+### Tests — 100 checks, all passing
 
 | File | Checks | Against what |
 |---|---|---|
@@ -79,10 +80,11 @@ first, bring up the wallet screen second.
 | `test_mdoc_auth.py` | 21 | Annex D.5.2 and D.5.3 vectors, plus negative cases |
 | `test_mdoc_reader.py` | 14 | A synthetic credential minted in-process, plus BLE mode choice |
 | `test_mdoc_nfc.py` | 27 | The Annex D.5.1 handover, plus a Handover Select read off the wallet |
+| `test_mdoc_transport.py` | 16 | Loopback framing — chunk prefixes, State ordering, reassembly |
 
 ```sh
 for t in d51_session_encryption_test test_mdoc_transcript test_mdoc_auth \
-         test_mdoc_reader test_mdoc_nfc
+         test_mdoc_reader test_mdoc_nfc test_mdoc_transport
 do .venv/bin/python $t.py; done
 ```
 
@@ -223,6 +225,19 @@ mode goes under it to `CBPeripheralManager` through PyObjC. The role *is*
 available to a Python process on macOS; it just is not available through bleak.
 CoreBluetooth delivers its callbacks on a dispatch queue, so every one of them
 hops back to the event loop with `call_soon_threadsafe`.
+
+Both classes grew the same four methods independently, because the driver uses
+them identically once the mode is chosen. `mdoc_transport.MdocTransport` writes
+that contract down, and `TransportError` is now the base of both modules'
+exceptions, so one `except` covers either mode.
+
+The third implementation uses no radio. A Mac cannot talk to itself over BLE —
+CoreBluetooth will not surface a machine's own advertisement to its own
+scanner — so a reader and an mdoc in one process can never find each other.
+`loopback_pair()` replaces the link with two queues and keeps the framing from
+8.3.3.1.1.6, chunk prefixes and State bytes included, because that is where
+transport bugs live. A loopback that passed whole messages would be a test of
+nothing much.
 
 The EUDI reference wallet offers peripheral server mode; `org.siros.id`
 (wwWallet in a native Android shell) offers central client mode only. Having

@@ -30,6 +30,8 @@ import uuid as _uuid
 
 from bleak import BleakClient, BleakScanner
 
+from mdoc_transport import TransportError
+
 # Table 11 — mdoc is the GATT server.
 STATE_UUID = "00000001-a123-48ce-896b-4c76973373e6"
 CLIENT_TO_SERVER_UUID = "00000002-a123-48ce-896b-4c76973373e6"
@@ -50,7 +52,7 @@ CHUNK_LAST = 0x00
 DEFAULT_MTU = 23  # the BLE minimum; only used if the stack won't tell us
 
 
-class BleTransportError(Exception):
+class BleTransportError(TransportError):
     pass
 
 

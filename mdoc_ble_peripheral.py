@@ -53,6 +53,8 @@ from CoreBluetooth import (
 )
 from Foundation import NSData, NSObject
 
+from mdoc_transport import TransportError
+
 # Table 12 — the mdoc reader is the GATT server.
 STATE_UUID = "00000005-A123-48CE-896B-4C76973373E6"
 CLIENT_TO_SERVER_UUID = "00000006-A123-48CE-896B-4C76973373E6"
@@ -68,7 +70,7 @@ CHUNK_LAST = 0x00
 DEFAULT_CHUNK = 20  # ATT_MTU 23 minus 3; only used until a central subscribes
 
 
-class BlePeripheralError(Exception):
+class BlePeripheralError(TransportError):
     pass
 
 
