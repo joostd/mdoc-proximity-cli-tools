@@ -71,7 +71,14 @@ first, bring up the wallet screen second.
 | `mdoc_nfc.py` | NFC static handover — Type 4 Tag APDUs over PC/SC, NDEF parsing |
 | `mdoc_reader.py` | The driver that composes the rest |
 
-### Tests — 100 checks, all passing
+### The other two roles
+
+| File | Role |
+|---|---|
+| `mdoc_issuer.py` | Mints a credential: MSO, value digests, a two-level PKI, the mandatory mDL elements |
+| `mdoc_holder.py` | Parses a DeviceRequest, decides what to disclose, signs a DeviceResponse |
+
+### Tests — 119 checks, all passing
 
 | File | Checks | Against what |
 |---|---|---|
@@ -81,10 +88,11 @@ first, bring up the wallet screen second.
 | `test_mdoc_reader.py` | 14 | A synthetic credential minted in-process, plus BLE mode choice |
 | `test_mdoc_nfc.py` | 27 | The Annex D.5.1 handover, plus a Handover Select read off the wallet |
 | `test_mdoc_transport.py` | 16 | Loopback framing — chunk prefixes, State ordering, reassembly |
+| `test_mdoc_holder.py` | 19 | Issuer → holder → reader in one process, including over-disclosure |
 
 ```sh
 for t in d51_session_encryption_test test_mdoc_transcript test_mdoc_auth \
-         test_mdoc_reader test_mdoc_nfc test_mdoc_transport
+         test_mdoc_reader test_mdoc_nfc test_mdoc_transport test_mdoc_holder
 do .venv/bin/python $t.py; done
 ```
 
@@ -152,6 +160,35 @@ provenance. That mDL claims `issuing_authority = 'SUNET'` and
 `https://sirosid-yitbarek-vc-apigw.fly.dev`. The payload is a claim; the
 certificate chain is the evidence, and only an out-of-band IACA makes the
 difference visible — which is the whole argument for `--trust-anchor`.
+
+### All three roles, in one process
+
+`mdoc_issuer` mints credentials and `mdoc_holder` presents them, so the reader
+can be run against a counterparty this repo did not also validate. Over the
+loopback transport the whole thing takes milliseconds and no handset.
+
+It turns the over-disclosure observation into an assertion. Ask a
+`Disclosure.EVERYTHING` holder for two elements, get eleven, and watch all five
+checks pass:
+
+```
+PASS  an over-sharing holder returns 11 elements for a 2-element request
+PASS  and the reader still reports VERIFIED — selective disclosure is
+      enforced by the holder alone
+```
+
+That test asserts success deliberately. A conformant reader *must* accept that
+response: every extra element carries a valid digest the issuer committed to,
+and nothing in the protocol records what was asked for. The gap between
+"verified" and "did not overshare" is not a bug to fix in the reader.
+
+`mdoc_issuer` is a fixture, not an issuer — no key management, no revocation,
+no device-key attestation, and the device private key is handed over in the
+clear instead of living in a secure element. The one thing it does take
+seriously is the per-item `random` salt (32 bytes from `secrets`, against the
+16-byte minimum in 9.1.2.5), because that salt is the only thing stopping a
+verifier brute-forcing `age_over_18` from the digests of the elements the
+holder *declined* to disclose.
 
 ### Two ways in: QR and NFC
 
