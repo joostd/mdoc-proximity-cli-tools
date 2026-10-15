@@ -26,6 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.x509.oid import NameOID
 
 from mdoc_auth import build_device_authentication_bytes
+from mdoc_ble import MdocBleReader
 from mdoc_reader import choose_ble_mode, validate_response
 from mdoc_transcript import (
     build_session_transcript,
@@ -254,6 +255,27 @@ def main() -> int:
             check(f"rejected: {why}", False, "no error raised")
         except ValueError as exc:
             check(f"rejected: {why}", True, str(exc))
+
+    # --- chunk size: 8.3.3.1.1.6 meets GATT ---------------------------------
+
+    print("\n-- chunk sizing --")
+
+    class _StubClient:
+        def __init__(self, mtu):
+            self.mtu_size = mtu
+
+    def chunk_at(mtu: int) -> int:
+        link = MdocBleReader(None, "unused")
+        link._client = _StubClient(mtu)
+        return link.chunk_size
+
+    check("MTU 23 (the BLE minimum) gives the 20-byte floor",
+          chunk_at(23) == 20)
+    check("MTU 185 gives MTU - 3", chunk_at(185) == 182)
+    check("MTU 517 gives 512, not 514",
+          chunk_at(517) == 512,
+          "a GATT attribute value is never longer than 512 octets, "
+          "whatever the MTU — BlueZ truncates past it without a word")
 
     print("\nALL PASS" if not _failures else f"\n{_failures} FAILURE(S)")
     return 1 if _failures else 0

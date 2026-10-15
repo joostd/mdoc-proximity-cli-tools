@@ -35,6 +35,37 @@ STATE_END = b"\x02"
 CHUNK_MORE = 0x01
 CHUNK_LAST = 0x00
 
+# Tables 11 and 12. These live here rather than in one of the BLE modules
+# because all three transports need them and the modules have incompatible
+# dependencies: `mdoc_ble` needs bleak, `mdoc_ble_peripheral` needs
+# CoreBluetooth, `mdoc_ble_holder` needs BlueZ and never runs on a Mac. A
+# mistyped UUID in one copy would show up only as a peer that is never found.
+#
+# The characteristic *names* are fixed by the table and do not follow the
+# roles: Server2Client always carries GATT-server -> GATT-client traffic, so
+# which side notifies on it depends on the mode, not on the name.
+
+# Table 11 — mdoc peripheral server mode: the mdoc is the GATT server.
+STATE_UUID = "00000001-a123-48ce-896b-4c76973373e6"
+CLIENT_TO_SERVER_UUID = "00000002-a123-48ce-896b-4c76973373e6"
+SERVER_TO_CLIENT_UUID = "00000003-a123-48ce-896b-4c76973373e6"
+
+# Table 12 — mdoc central client mode: the reader is the GATT server, and
+# there is an extra Ident characteristic the mdoc reads to check it found us.
+PERIPHERAL_STATE_UUID = "00000005-a123-48ce-896b-4c76973373e6"
+PERIPHERAL_CLIENT_TO_SERVER_UUID = "00000006-a123-48ce-896b-4c76973373e6"
+PERIPHERAL_SERVER_TO_CLIENT_UUID = "00000007-a123-48ce-896b-4c76973373e6"
+PERIPHERAL_IDENT_UUID = "00000008-a123-48ce-896b-4c76973373e6"
+
+
+def service_uuid_str(raw: bytes) -> str:
+    """16 engagement bytes -> the dashed UUID string every BLE stack wants."""
+    import uuid
+
+    if len(raw) != 16:
+        raise ValueError(f"service UUID must be 16 bytes, got {len(raw)}")
+    return str(uuid.UUID(bytes=raw))
+
 
 class TransportError(Exception):
     """The session link failed. Base class for every transport's errors, so a

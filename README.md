@@ -12,6 +12,10 @@ Verified end to end against two unrelated wallets: the EUDI reference wallet
 over QR on 2026-10-13 and over NFC on 2026-10-14, and wwWallet (`org.siros.id`)
 on 2026-10-14 in the opposite BLE role, where the reader is the GATT server.
 
+It also ends with a **wallet**. `mdoc_wallet.py` mints a credential, advertises
+as an mdoc over BlueZ and presents it — so on 2026-10-15 both halves of
+18013-5, both written here, met over a real radio between two machines.
+
 ```
 Document: eu.europa.ec.eudi.employee.1
   [ok] issuer data authentication — signature valid
@@ -43,7 +47,8 @@ python3 -m venv .venv && .venv/bin/pip install cbor2 cryptography bleak zxing-cp
 ```
 
 Built against Python 3.14, cbor2 6.1.5, cryptography 50.0.2, bleak 3.0.2,
-pyscard 2.3.1.
+pyscard 2.3.1. The wallet side was run on a Raspberry Pi 5 — Python 3.13.5,
+BlueZ 5.82, the distribution's dbus-python and pygobject.
 
 If you have the URI already, pass it directly; `--dry-run` builds the whole
 request and stops before touching the radio:
@@ -55,6 +60,25 @@ request and stops before touching the radio:
 The engagement QR is single-use and the wallet stops advertising the moment its
 screen closes, so `--wait` is usually the practical option: start the reader
 first, bring up the wallet screen second.
+
+No wallet to hand? Run ours. It needs a second machine with BlueZ — a Raspberry
+Pi does, a Mac does not — because a Mac cannot see its own advertisement:
+
+```sh
+# on the Pi: cbor2 and cryptography, plus the system dbus-python and pygobject
+pi$  python3 -m venv --system-site-packages .venv
+pi$  .venv/bin/pip install cbor2 cryptography
+pi$  .venv/bin/python mdoc_wallet.py --save-anchor iaca.pem --reuse-pki pki.pem -v
+     mdoc:owBjMS4wAYIB2BhYS6QBAiABIVgg…
+
+# on the Mac: the IACA has to travel out of band, exactly as a trust list would
+mac$ scp pi:iaca.pem .
+mac$ .venv/bin/python mdoc_reader.py 'mdoc:owBjMS4w…' --trust-anchor iaca.pem \
+         --doc-type org.iso.18013.5.1.mDL --element family_name -v
+```
+
+`--device-mac` makes it answer with `deviceMac` instead of `deviceSignature`,
+and `--disclosure everything` makes it the over-sharing wallet below.
 
 ## What's here
 
@@ -77,15 +101,17 @@ first, bring up the wallet screen second.
 |---|---|
 | `mdoc_issuer.py` | Mints a credential: MSO, value digests, a two-level PKI, the mandatory mDL elements |
 | `mdoc_holder.py` | Parses a DeviceRequest, decides what to disclose, signs or MACs a DeviceResponse — and `HolderSession` runs the whole session, QR included |
+| `mdoc_ble_holder.py` | The `MdocTransport` contract from the mdoc's side — a GATT server and LE advertisement over BlueZ |
+| `mdoc_wallet.py` | The driver: mint, advertise, print the URI, present |
 
-### Tests — 143 checks, all passing
+### Tests — 146 checks, all passing
 
 | File | Checks | Against what |
 |---|---|---|
 | `d51_session_encryption_test.py` | 5 | Annex D.5.1 — ECDH, HKDF, AES-256-GCM |
 | `test_mdoc_transcript.py` | 17 | A real captured session, byte-for-byte |
 | `test_mdoc_auth.py` | 21 | Annex D.5.2 and D.5.3 vectors, plus negative cases |
-| `test_mdoc_reader.py` | 14 | A synthetic credential minted in-process, plus BLE mode choice |
+| `test_mdoc_reader.py` | 17 | A synthetic credential minted in-process, plus BLE mode choice and chunk sizing |
 | `test_mdoc_nfc.py` | 27 | The Annex D.5.1 handover, plus a Handover Select read off the wallet |
 | `test_mdoc_transport.py` | 16 | Loopback framing — chunk prefixes, State ordering, reassembly |
 | `test_mdoc_holder.py` | 19 | Issuer → holder → reader in one process, including over-disclosure |
@@ -222,10 +248,9 @@ mdoc calls it as `derive_session_keys(edevice_private, ereader_public, stb)`.
 Its parameter names stay reader-centric because that is where it is used in
 anger.
 
-What this is still not is a wallet. There is no holder consent, no UI, no key
-attestation, and `HolderSession` has never driven a real radio — it speaks the
-`MdocTransport` contract, so `mdoc_ble.py` would accept it, but nothing in this
-repo has yet advertised as an mdoc.
+What this is still not is a wallet: no holder consent, no UI, no key
+attestation, and the device private key sits in memory rather than in a secure
+element. But it does now speak over a radio — see *A wallet of our own* below.
 
 #### What a holder was for: `deviceMac`
 
@@ -258,6 +283,58 @@ The practical cost is that `ereader_private` has to survive all the way down
 into `validate_response`, which for `deviceSignature` is needed nowhere past
 decryption. That is the signature change the variant forces, and the reason it
 sat unwired for as long as it did.
+
+### A wallet of our own
+
+Everything above happened in one process. `mdoc_ble_holder.py` gives the holder
+a radio: it is the third implementation of the `MdocTransport` contract, and
+the first one where *we* are the GATT server — the mdoc side of Table 11,
+exported over BlueZ's D-Bus API. `mdoc_wallet.py` drives it.
+
+That needs a second machine. A Mac cannot read a wallet running on the same
+Mac, for the reason `loopback_pair()` exists, and CoreBluetooth cannot be a
+GATT server for a *fresh* service UUID per transaction anyway. A Raspberry Pi
+running BlueZ 5.82 can, as a non-root user. On 2026-10-15, Pi to MacBook:
+
+```
+[bluez] advertising 7231fb68-0197-c8ef-825a-fc7c031d684d on hci0
+[bluez] reader ready, MTU 517, chunk size 512
+[holder] org.iso.18013.5.1.mDL: asked 2, disclosing 2 (requested), deviceSignature
+[bluez] sending 1704 bytes in 4 chunk(s) of <= 511
+```
+```
+  [ok] mdoc authentication (deviceSignature) — bound to this session transcript
+      org.iso.18013.5.1/family_name = 'Mustermann'
+VERIFIED
+```
+
+And with `--device-mac`, the variant no shipping wallet will send:
+
+```
+  [ok] mdoc authentication (deviceMac) — bound to this session transcript and to this reader
+```
+
+Standing up a GATT server over BlueZ is mostly D-Bus, not Bluetooth, and three
+things cost real time:
+
+**The service has to be a real exported object.** Returning it from
+`GetManagedObjects` is not enough — `org.bluez.GattService1` must exist at its
+own path, the way the characteristics do. Without it `RegisterApplication`
+*succeeds*, the advertisement goes up, the Mac connects, and the service simply
+is not in the GATT database. The only diagnostic is one line in the
+bluetoothd journal: `gatt-database.c:client_ready_cb() No object received`.
+
+**`RegisterApplication` will deadlock a blocking call.** BlueZ answers it by
+calling `GetManagedObjects` back on us over the same connection, so a
+synchronous call holding the GLib thread can never be served and you get
+`org.freedesktop.DBus.Error.NoReply` after 25 seconds. Both registrations go
+out with `reply_handler=`/`error_handler=` resolving asyncio futures instead.
+
+**A GATT server learns the MTU only from `options`.** There is nothing to
+query: BlueZ passes `{'mtu': 517, …}` to `ReadValue` and `WriteValue`, and
+that dict is the only place it appears. Until the reader's first write the
+holder has to assume the 23-byte minimum — which is correct, and costs
+nothing, because the reader's first write is `State=Start`.
 
 ### Two ways in: QR and NFC
 
@@ -318,7 +395,8 @@ rebuilds the published `SessionTranscriptBytes` byte for byte.
 | characteristics | Table 11, `0x0001`–`0x0003` | Table 12, `0x0005`–`0x0008` |
 | `Ident` | absent | present — served by the **reader** |
 | engagement | BleOptions `0: true`, UUID in `10` | BleOptions `1: true`, UUID in `11` |
-| module | `mdoc_ble.py` | `mdoc_ble_peripheral.py` |
+| reader module | `mdoc_ble.py` | `mdoc_ble_peripheral.py` |
+| mdoc module | `mdoc_ble_holder.py` | — |
 
 When a wallet offers both, 8.3.3.1.1.1 says the reader *should* choose central
 client mode, which is what `--ble-mode auto` does. `choose_ble_mode` makes that
@@ -337,7 +415,7 @@ them identically once the mode is chosen. `mdoc_transport.MdocTransport` writes
 that contract down, and `TransportError` is now the base of both modules'
 exceptions, so one `except` covers either mode.
 
-The third implementation uses no radio. A Mac cannot talk to itself over BLE —
+A fourth implementation uses no radio at all. A Mac cannot talk to itself over BLE —
 CoreBluetooth will not surface a machine's own advertisement to its own
 scanner — so a reader and an mdoc in one process can never find each other.
 `loopback_pair()` replaces the link with two queues and keeps the framing from
@@ -361,7 +439,7 @@ unless the handset is awake; the reliable choreography is to wait for
 `ProximityBridge: Proximity session started in CENTRAL mode` in logcat and
 screencap a second later.
 
-### Seven things that will cost you an afternoon
+### Nine things that will cost you an afternoon
 
 **The transcript must carry the QR bytes verbatim.** `DeviceEngagementBytes` is
 the exact byte string that came off the QR. Decoding it to a dict and
@@ -431,6 +509,27 @@ chain. A verifier that cannot parse an anchor must not report it as an anchor
 that does not match: the first is a bug here, the second is a fact about the
 credential, and conflating them sends you looking in the wrong place.
 
+**MTU − 3 is wrong above MTU 515.** 8.3.3.1.1.6 sizes every message part at
+MTU − 3 and says no more. GATT says an attribute value is at most 512 octets
+(Core 5.3 Vol 3 Part F 3.2.9), and a notification carries an attribute value.
+A Pi and a MacBook negotiate 517, so MTU − 3 is 514 — and BlueZ sends 512 of
+those bytes and drops the other two, per chunk, without a word in any log.
+`btmon` shows `Handle Value Notification len 514`, which is the handle plus
+512. A 1592-byte DeviceResponse arrived as 1586 and CBOR decoding failed six
+bytes from the end, nowhere near the lie. The chunk size is
+`min(MTU − 3, 512)` in both directions now; macOS hides the bug on the reader
+side, because bleak derives `mtu_size` from `maximumWriteValueLength`, which
+Apple already caps at 512.
+
+**Don't let teardown hold the result hostage.** The reader's `close()` writes
+`State=End`, unsubscribes, disconnects — and an mdoc that unregisters its GATT
+application the instant it sees the session termination leaves `stop_notify`
+waiting on handles that no longer exist. bleak waits forever. The
+DeviceResponse was decrypted and in hand; the verdict is printed after the
+`async with` block, so nothing was ever shown. Every step of the teardown is
+on a 3-second clock now. Past the last `receive()`, nothing the peer does
+should be able to cost you the answer.
+
 **Don't look characteristics up by UUID alone.** Every transaction gets a fresh
 *service* UUID but reuses the same three *characteristic* UUIDs, and macOS
 caches a peripheral's GATT database. The second time you talk to a wallet there
@@ -448,13 +547,20 @@ Start write into a dead service and a silent hang.
 - **No reader authentication.** The `DeviceRequest` carries no `readerAuth`, so
   the wallet cannot tell who is asking and will say so. Fixing this needs a
   reader certificate the wallet's trust list recognises.
-- **`deviceMac` has never been seen from a real wallet.** Both ends are wired
-  now and the round trip passes, but the only mdoc that has ever sent one is
-  `mdoc_holder.py`. Neither the EUDI wallet nor `org.siros.id` offers it, so
-  the variant is tested against a counterparty this repo also wrote.
-- **`HolderSession` has never driven a radio.** It speaks the `MdocTransport`
-  contract, so `mdoc_ble.py` would take it, but nothing here has advertised as
-  an mdoc. Everything the holder has presented, it presented over the loopback.
+- **`deviceMac` has never been seen from a real wallet.** Both ends are wired,
+  and it has now travelled over a radio between two machines — but the only
+  mdoc that has ever sent one is `mdoc_holder.py`. Neither the EUDI wallet nor
+  `org.siros.id` offers it, so the variant is still tested against a
+  counterparty this repo also wrote.
+- **`mdoc_wallet.py` only does peripheral server mode.** It is the mdoc half of
+  Table 11. Table 12 — where the mdoc is the GATT client and reads `Ident` off
+  the reader — exists only on the reader side here, in
+  `mdoc_ble_peripheral.py`, so the two halves of this repo cannot meet in the
+  mode `org.siros.id` uses.
+- **No real wallet has ever read this repo's holder**, and no real verifier has
+  ever read it either. Both ends of every radio session so far were written
+  here, which proves they agree with each other and not that either agrees
+  with the spec. The Annex D vectors are the only outside judge.
 - **NFC engagement only, static handover only.** ISO 18013-5 also defines NFC
   *data retrieval* (8.3.3.2), running the whole session over APDUs with no
   radio handover at all; the EUDI wallet does not implement it. Negotiated

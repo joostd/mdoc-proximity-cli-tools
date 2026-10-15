@@ -26,41 +26,31 @@ Requires: bleak
 from __future__ import annotations
 
 import asyncio
-import uuid as _uuid
 
 from bleak import BleakClient, BleakScanner
 
-from mdoc_transport import TransportError
-
-# Table 11 — mdoc is the GATT server.
-STATE_UUID = "00000001-a123-48ce-896b-4c76973373e6"
-CLIENT_TO_SERVER_UUID = "00000002-a123-48ce-896b-4c76973373e6"
-SERVER_TO_CLIENT_UUID = "00000003-a123-48ce-896b-4c76973373e6"
-
-# Table 12 — reader is the GATT server. Here for reference; unused in this mode.
-PERIPHERAL_STATE_UUID = "00000005-a123-48ce-896b-4c76973373e6"
-PERIPHERAL_CLIENT_TO_SERVER_UUID = "00000006-a123-48ce-896b-4c76973373e6"
-PERIPHERAL_SERVER_TO_CLIENT_UUID = "00000007-a123-48ce-896b-4c76973373e6"
-PERIPHERAL_IDENT_UUID = "00000008-a123-48ce-896b-4c76973373e6"
-
-STATE_START = b"\x01"
-STATE_END = b"\x02"
-
-CHUNK_MORE = 0x01
-CHUNK_LAST = 0x00
+from mdoc_transport import (  # noqa: F401 — re-exported for existing callers
+    CHUNK_LAST,
+    CHUNK_MORE,
+    CLIENT_TO_SERVER_UUID,
+    PERIPHERAL_CLIENT_TO_SERVER_UUID,
+    PERIPHERAL_IDENT_UUID,
+    PERIPHERAL_SERVER_TO_CLIENT_UUID,
+    PERIPHERAL_STATE_UUID,
+    SERVER_TO_CLIENT_UUID,
+    STATE_END,
+    STATE_START,
+    STATE_UUID,
+    TransportError,
+    service_uuid_str,
+)
 
 DEFAULT_MTU = 23  # the BLE minimum; only used if the stack won't tell us
+MAX_ATTRIBUTE_VALUE = 512  # Core 5.3 Vol 3 Part F 3.2.9; see `chunk_size`
 
 
 class BleTransportError(TransportError):
     pass
-
-
-def service_uuid_str(raw: bytes) -> str:
-    """16 engagement bytes -> the dashed UUID string bleak expects."""
-    if len(raw) != 16:
-        raise ValueError(f"service UUID must be 16 bytes, got {len(raw)}")
-    return str(_uuid.UUID(bytes=raw))
 
 
 async def find_mdoc(service_uuid: str, *, timeout: float = 15.0):
@@ -158,20 +148,39 @@ class MdocBleReader:
         self._log("sent State=Start (0x01)")
 
     async def close(self, *, send_end: bool = True) -> None:
+        """Signal End and drop the link, on a clock.
+
+        Every step here is bounded, because by this point we already have the
+        DeviceResponse and nothing the peer does should be able to hold it
+        hostage. That is not hypothetical: an mdoc that unregisters its GATT
+        application the instant it sees the termination leaves our
+        `stop_notify` waiting on handles that no longer exist, and bleak waits
+        forever. The response was already in hand; the verdict was not.
+        """
         if self._client is None or not self._client.is_connected:
             return
         try:
             if send_end:
-                await self._client.write_gatt_char(self._state, STATE_END,
-                                                   response=False)
-            await self._client.stop_notify(self._server_to_client)
-            await self._client.stop_notify(self._state)
+                await self._bounded(
+                    self._client.write_gatt_char(self._state, STATE_END,
+                                                 response=False))
+            await self._bounded(self._client.stop_notify(self._server_to_client))
+            await self._bounded(self._client.stop_notify(self._state))
         except Exception as exc:  # a dropped link during teardown is not interesting
-            self._log(f"teardown warning: {exc}")
+            # `str()` on a TimeoutError is empty, and that is the one we expect
+            # most here — print the class when there is nothing else to print.
+            self._log(f"teardown warning: {str(exc) or type(exc).__name__}")
         finally:
-            await self._client.disconnect()
+            try:
+                await self._bounded(self._client.disconnect())
+            except Exception as exc:
+                self._log(f"disconnect warning: {str(exc) or type(exc).__name__}")
             self._client = None
             self._log("disconnected")
+
+    @staticmethod
+    async def _bounded(awaitable, timeout: float = 3.0):
+        return await asyncio.wait_for(awaitable, timeout)
 
     # --- properties --------------------------------------------------------
 
@@ -184,9 +193,16 @@ class MdocBleReader:
 
     @property
     def chunk_size(self) -> int:
-        """8.3.3.1.1.6 — MTU minus 3. The 3 covers the ATT write header; the
-        1-byte continuation prefix comes out of the payload on top of that."""
-        return max(self.mtu - 3, 20)
+        """8.3.3.1.1.6 — MTU minus 3, capped at 512.
+
+        The 3 covers the ATT write header; the 1-byte continuation prefix
+        comes out of the payload on top of that. The cap is GATT's maximum
+        attribute value length, which 18013-5 does not mention and which bites
+        above MTU 515 — `mdoc_ble_holder.chunk_size` tells that story. macOS
+        hides it here, because bleak derives `mtu_size` from
+        `maximumWriteValueLength`, which Apple already caps at 512.
+        """
+        return max(min(self.mtu - 3, MAX_ATTRIBUTE_VALUE), 20)
 
     # --- notification handlers ---------------------------------------------
 
