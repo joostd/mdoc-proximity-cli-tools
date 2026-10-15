@@ -28,6 +28,8 @@ Requires: cbor2, cryptography
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import secrets
 from dataclasses import dataclass
 from enum import Enum
@@ -38,7 +40,12 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from mdoc_auth import COSE_ALG_ES256, build_device_authentication_bytes
+from mdoc_auth import (
+    COSE_ALG_ES256,
+    COSE_ALG_HMAC_256,
+    build_device_authentication_bytes,
+    derive_emac_key,
+)
 from mdoc_issuer import Credential
 from mdoc_transcript import (
     build_device_engagement,
@@ -80,6 +87,26 @@ class Disclosure(Enum):
     NOTHING = "nothing"
     """Disclose no elements at all. The response is still well-formed and
     still authenticates; it simply opens nothing."""
+
+
+class DeviceAuth(Enum):
+    """Which of the two mdoc authentication variants in 9.1.3 to produce.
+
+    SIGNATURE is what both wallets this repo has read actually send, and the
+    only one a reader can verify without having been the counterparty. MAC is
+    the reason this module exists: `mdoc_auth.verify_device_mac` has been
+    correct against the Annex D.5.3 vector since the beginning and had never
+    once run against something that was not the test vector.
+    """
+
+    SIGNATURE = "deviceSignature"
+    """ECDSA over DeviceAuthenticationBytes. Anyone holding the transcript and
+    the MSO can check it — including, later, someone who was not there."""
+
+    MAC = "deviceMac"
+    """HMAC under EMacKey, from ECDH between the credential's device key and
+    EReaderKey. Only the reader in that session can verify it, which is a
+    feature: the response is not evidence to anyone else."""
 
 
 @dataclass(frozen=True)
@@ -149,9 +176,11 @@ class MdocHolder:
 
     def __init__(self, credentials: list[Credential], *,
                  disclosure: Disclosure = Disclosure.REQUESTED,
+                 device_auth: DeviceAuth = DeviceAuth.SIGNATURE,
                  verbose: bool = False):
         self._credentials = {c.doc_type: c for c in credentials}
         self._disclosure = disclosure
+        self._device_auth = device_auth
         self._verbose = verbose
 
     # --- disclosure ---------------------------------------------------------
@@ -196,15 +225,53 @@ class MdocHolder:
         r, s = utils.decode_dss_signature(der)
         return [protected, {}, None, r.to_bytes(32, "big") + s.to_bytes(32, "big")]
 
+    def _device_mac(self, credential: Credential, session_transcript: bytes,
+                    device_namespaces_raw: bytes,
+                    ereader_public: ec.EllipticCurvePublicKey) -> list:
+        """9.1.3.5 — COSE_Mac0 under EMacKey, payload detached.
+
+        The agreement is between the credential's *static* device key and the
+        reader's ephemeral key, not between the two ephemeral keys — so EMacKey
+        is not derivable from the session keys, and a reader that threw away
+        its ephemeral private key after decryption cannot check this at all.
+        """
+        zab = credential.device_private_key.exchange(ec.ECDH(), ereader_public)
+        emac_key = derive_emac_key(zab, session_transcript_bytes(session_transcript))
+
+        protected = cbor2.dumps({1: COSE_ALG_HMAC_256})
+        device_auth_bytes = build_device_authentication_bytes(
+            session_transcript, credential.doc_type, device_namespaces_raw)
+        tag = hmac.new(emac_key,
+                       cbor2.dumps(["MAC0", protected, b"", device_auth_bytes]),
+                       hashlib.sha256).digest()
+        return [protected, {}, None, tag]
+
+    def _device_auth_entry(self, credential: Credential, session_transcript: bytes,
+                           device_namespaces_raw: bytes, ereader_public) -> dict:
+        """The one-key `deviceAuth` map, in whichever variant is configured."""
+        if self._device_auth is DeviceAuth.SIGNATURE:
+            return {"deviceSignature": self._device_signature(
+                credential, session_transcript, device_namespaces_raw)}
+        if ereader_public is None:
+            raise HolderError(
+                "deviceMac needs the reader's ephemeral public key; pass "
+                "ereader_public to respond(), or let HolderSession do it")
+        return {"deviceMac": self._device_mac(
+            credential, session_transcript, device_namespaces_raw, ereader_public)}
+
     # --- response -----------------------------------------------------------
 
-    def respond(self, device_request: bytes, session_transcript: bytes) -> bytes:
+    def respond(self, device_request: bytes, session_transcript: bytes, *,
+                ereader_public: ec.EllipticCurvePublicKey | None = None) -> bytes:
         """Build a DeviceResponse for one DeviceRequest.
 
         Every docType the reader asked for and we do not hold becomes a
         documentError rather than silence — 8.3.2.1.2.2 is explicit that the
         mdoc says so, and a reader that cannot tell "no such document" from "no
         answer" has to guess.
+
+        `ereader_public` is only needed for `DeviceAuth.MAC`, which agrees a
+        key with it. `HolderSession` already has it and passes it through.
         """
         version, requests = parse_device_request(device_request)
         self._log(f"DeviceRequest {version}, {len(requests)} docRequest(s), "
@@ -221,7 +288,8 @@ class MdocHolder:
             disclosed = self._disclose(credential, request)
             opened = sum(len(items) for items in disclosed.values())
             self._log(f"{request.doc_type}: asked {request.element_count}, "
-                      f"disclosing {opened} ({self._disclosure.value})")
+                      f"disclosing {opened} ({self._disclosure.value}), "
+                      f"{self._device_auth.value}")
 
             # DeviceNameSpaces is empty: these are elements the *device*
             # asserts rather than the issuer, and this holder has none. It is
@@ -235,8 +303,9 @@ class MdocHolder:
                 },
                 "deviceSigned": {
                     "nameSpaces": tag24(device_namespaces_raw),
-                    "deviceAuth": {"deviceSignature": self._device_signature(
-                        credential, session_transcript, device_namespaces_raw)},
+                    "deviceAuth": self._device_auth_entry(
+                        credential, session_transcript, device_namespaces_raw,
+                        ereader_public),
                 },
             })
 
@@ -291,6 +360,7 @@ class HolderSession:
         )
         self.transcript: bytes | None = None
         self._keys: dict[str, bytes] | None = None
+        self._ereader_public: ec.EllipticCurvePublicKey | None = None
         self.terminated = False
 
     @property
@@ -324,7 +394,8 @@ class HolderSession:
             session_nonce(1, reader=True), envelope["data"], None)
         self._log(f"decrypted a {len(request)} byte DeviceRequest")
 
-        response = self._holder.respond(request, self.transcript)
+        response = self._holder.respond(request, self.transcript,
+                                        ereader_public=self._ereader_public)
         ciphertext = AESGCM(self._keys["SKDevice"]).encrypt(
             session_nonce(1, reader=False), response, None)
         return cbor2.dumps({"data": ciphertext})
@@ -343,7 +414,9 @@ class HolderSession:
         cose = cbor2.loads(raw)
         if cose.get(-1) != 1:
             raise HolderError(f"unsupported COSE curve {cose.get(-1)!r}; P-256 only")
-        ereader_public = ec.EllipticCurvePublicNumbers(
+        # Kept on the session: EMacKey agrees the credential's device key with
+        # this, long after the session keys have been derived from it.
+        self._ereader_public = ec.EllipticCurvePublicNumbers(
             int.from_bytes(cose[-2], "big"),
             int.from_bytes(cose[-3], "big"),
             ec.SECP256R1()).public_key()
@@ -351,7 +424,7 @@ class HolderSession:
         self.transcript = build_session_transcript(
             self.engagement_raw, raw, self._handover)
         self._keys = derive_session_keys(
-            self._edevice_private, ereader_public,
+            self._edevice_private, self._ereader_public,
             session_transcript_bytes(self.transcript))
         self._log(f"SessionTranscript {len(self.transcript)} bytes, SKDevice "
                   f"{self._keys['SKDevice'][:8].hex()}…")

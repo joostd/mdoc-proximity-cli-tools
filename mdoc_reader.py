@@ -42,7 +42,9 @@ from mdoc_auth import (
     ValidationError,
     build_device_authentication_bytes,
     check_mso_validity,
+    derive_emac_key,
     device_public_key_from_mso,
+    verify_device_mac,
     verify_device_signature,
     verify_issuer_auth,
     verify_value_digests,
@@ -114,8 +116,15 @@ def report(label: str, ok: bool, detail: str = "") -> bool:
 
 
 def validate_response(device_response: dict, session_transcript: bytes,
-                      anchors: list, *, require_chain: bool) -> bool:
-    """Run every check 18013-5 requires of a reader, and report each one."""
+                      anchors: list, *, require_chain: bool,
+                      ereader_private=None) -> bool:
+    """Run every check 18013-5 requires of a reader, and report each one.
+
+    `ereader_private` is the reader's ephemeral private key, and is only
+    needed for the `deviceMac` variant — which agrees EMacKey with it rather
+    than with anything derivable from the session keys. Keeping it this far
+    down the call is the whole cost of supporting that variant.
+    """
     now = datetime.now(timezone.utc)
     all_ok = True
 
@@ -184,11 +193,29 @@ def validate_response(device_response: dict, session_transcript: bytes,
                        "bound to this session transcript")
             except ValidationError as exc:
                 all_ok &= report("mdoc authentication (deviceSignature)", False, str(exc))
+        elif "deviceMac" in device_auth:
+            # EMacKey agrees the MSO's *static* device key with EReaderKey, so
+            # unlike deviceSignature this can only ever be checked by the
+            # reader that was there — a captured response proves nothing to a
+            # third party, which is the point of the variant.
+            if ereader_private is None:
+                all_ok &= report("mdoc authentication (deviceMac)", False,
+                                 "needs the reader's ephemeral private key")
+            else:
+                try:
+                    zab = ereader_private.exchange(
+                        ec.ECDH(), device_public_key_from_mso(mso))
+                    verify_device_mac(
+                        device_auth["deviceMac"],
+                        derive_emac_key(zab, session_transcript_bytes(session_transcript)),
+                        device_auth_bytes)
+                    report("mdoc authentication (deviceMac)", True,
+                           "bound to this session transcript and to this reader")
+                except ValidationError as exc:
+                    all_ok &= report("mdoc authentication (deviceMac)", False, str(exc))
         else:
-            # deviceMac needs EMacKey from the *static* device key, which the
-            # reader can only derive if the MSO device key is an agreement key.
-            all_ok &= report("mdoc authentication (deviceMac)", False,
-                             "deviceMac path not wired up in this reader")
+            all_ok &= report("mdoc authentication", False,
+                             f"deviceAuth has neither variant: {sorted(device_auth)}")
 
         for element in elements:
             print(f"      {element.namespace}/{element.identifier} = {element.value!r}")
@@ -340,7 +367,8 @@ async def run(device_engagement_raw: bytes, requests: list[tuple[str, dict]],
           f"status {device_response['status']}")
 
     ok = validate_response(device_response, transcript, anchors,
-                           require_chain=require_chain)
+                           require_chain=require_chain,
+                           ereader_private=ereader_private)
     print("\nVERIFIED" if ok else "\nNOT VERIFIED — see failures above")
     return 0 if ok else 1
 

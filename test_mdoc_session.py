@@ -19,13 +19,20 @@ import asyncio
 import contextlib
 import io
 import sys
+from dataclasses import dataclass
 
 import cbor2
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from mdoc_holder import Disclosure, HolderError, HolderSession, MdocHolder
+from mdoc_holder import (
+    DeviceAuth,
+    Disclosure,
+    HolderError,
+    HolderSession,
+    MdocHolder,
+)
 from mdoc_issuer import MDL_DOC_TYPE, MDL_NAMESPACE, mint, sample_mdl_elements
 from mdoc_reader import (
     STATUS_TERMINATION,
@@ -69,13 +76,33 @@ async def raises(label, exc_type, coro):
         check(label, False, "accepted when it should have been rejected")
 
 
-def verify(response, transcript, anchors):
-    """`validate_response`, with its five-line report swallowed."""
-    with contextlib.redirect_stdout(io.StringIO()):
-        return validate_response(response, transcript, anchors, require_chain=True)
+@dataclass
+class ReaderView:
+    """Everything the reader ended up holding, and nothing the mdoc held.
+
+    `ereader_private` is in here because `deviceMac` needs it: EMacKey agrees
+    the credential's static device key with EReaderKey, so a reader that
+    discarded its ephemeral private key after decrypting cannot check the MAC
+    at all. `deviceSignature` needs nothing but the transcript.
+    """
+    transcript: bytes
+    keys: dict
+    response: dict
+    ereader_private: ec.EllipticCurvePrivateKey
+
+    def verify(self, anchors):
+        """`validate_response`, with its per-check report swallowed."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            return validate_response(self.response, self.transcript, anchors,
+                                     require_chain=True,
+                                     ereader_private=self.ereader_private)
+
+    def device_auth(self) -> str:
+        """Which mdoc authentication variant came back."""
+        return next(iter(self.response["documents"][0]["deviceSigned"]["deviceAuth"]))
 
 
-async def drive_reader(transport, uri, requests, *, timeout=5.0):
+async def drive_reader(transport, uri, requests, *, timeout=5.0) -> ReaderView:
     """The reader half of `mdoc_reader.run()`, minus the radio and the printing.
 
     Deliberately re-implemented from the engagement rather than sharing state
@@ -97,7 +124,7 @@ async def drive_reader(transport, uri, requests, *, timeout=5.0):
     plaintext = AESGCM(keys["SKDevice"]).decrypt(
         session_nonce(1, reader=False), reply["data"], None)
     await transport.send(cbor2.dumps({"status": STATUS_TERMINATION}))
-    return transcript, keys, cbor2.loads(plaintext)
+    return ReaderView(transcript, keys, cbor2.loads(plaintext), ereader_private)
 
 
 async def present(holder, requests, *, central_client_mode=False, verbose=False):
@@ -108,10 +135,9 @@ async def present(holder, requests, *, central_client_mode=False, verbose=False)
 
     async with reader_link, mdoc_link:
         mdoc_task = asyncio.create_task(session.serve(mdoc_link, timeout=5.0))
-        transcript, keys, response = await drive_reader(
-            reader_link, session.uri, requests)
+        view = await drive_reader(reader_link, session.uri, requests)
         await asyncio.wait_for(mdoc_task, timeout=5.0)
-    return session, transcript, keys, response
+    return session, view
 
 
 async def main() -> int:
@@ -165,19 +191,19 @@ async def main() -> int:
 
     # --- a whole session ----------------------------------------------------
 
-    session, transcript, keys, response = await present(
-        MdocHolder([credential]), requests)
+    session, view = await present(MdocHolder([credential]), requests)
 
     check("both sides derived the same SessionTranscript",
-          session.transcript == transcript,
-          f"{len(transcript)} bytes, independently built")
+          session.transcript == view.transcript,
+          f"{len(view.transcript)} bytes, independently built")
     check("both sides derived the same session keys",
-          session._keys == keys, f"SKDevice {keys['SKDevice'][:8].hex()}…")
+          session._keys == view.keys,
+          f"SKDevice {view.keys['SKDevice'][:8].hex()}…")
 
     check("the reader verifies a credential presented over the loopback",
-          verify(response, transcript, anchors))
+          view.verify(anchors))
 
-    disclosed = response["documents"][0]["issuerSigned"]["nameSpaces"][MDL_NAMESPACE]
+    disclosed = view.response["documents"][0]["issuerSigned"]["nameSpaces"][MDL_NAMESPACE]
     names = sorted(cbor2.loads(i.value)["elementIdentifier"] for i in disclosed)
     check("and got exactly the two elements it asked for",
           names == ["family_name", "portrait"], ", ".join(names))
@@ -186,21 +212,57 @@ async def main() -> int:
 
     # --- the same, in the other BLE role ------------------------------------
 
-    _, central_transcript, _, central_response = await present(
-        MdocHolder([credential]), requests, central_client_mode=True)
+    _, central_view = await present(MdocHolder([credential]), requests,
+                                    central_client_mode=True)
     check("a central-client engagement presents identically",
-          verify(central_response, central_transcript, anchors),
+          central_view.verify(anchors),
           "the mode changes the radio, not the session")
+
+    # --- deviceMac ----------------------------------------------------------
+
+    check("the default variant is deviceSignature", view.device_auth() == "deviceSignature",
+          "what both wallets this repo has read actually send")
+
+    _, mac_view = await present(
+        MdocHolder([credential], device_auth=DeviceAuth.MAC), requests)
+    check("a deviceMac holder sends a COSE_Mac0 instead",
+          mac_view.device_auth() == "deviceMac")
+    check("and the reader verifies it against EMacKey",
+          mac_view.verify(anchors),
+          "first time this path has run outside the Annex D.5.3 vector")
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        blind = validate_response(mac_view.response, mac_view.transcript, anchors,
+                                  require_chain=True, ereader_private=None)
+    check("a reader that discarded its ephemeral key cannot verify the MAC",
+          not blind,
+          "unlike deviceSignature, the response is not evidence to anyone else")
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        stranger = validate_response(
+            mac_view.response, mac_view.transcript, anchors, require_chain=True,
+            ereader_private=ec.generate_private_key(ec.SECP256R1()))
+    check("nor can a reader holding the wrong ephemeral key", not stranger,
+          "EMacKey agrees the device key with EReaderKey, not with the session keys")
+
+    try:
+        MdocHolder([credential], device_auth=DeviceAuth.MAC).respond(
+            build_device_request(requests), mac_view.transcript)
+    except HolderError as exc:
+        check("a MAC holder refuses to respond without the reader's key", True,
+              f"rejected: {exc}")
+    else:
+        check("a MAC holder refuses to respond without the reader's key", False,
+              "produced a deviceAuth it had no key material for")
 
     # --- over-disclosure survives the full stack ----------------------------
 
-    _, greedy_transcript, _, greedy_response = await present(
+    _, greedy_view = await present(
         MdocHolder([credential], disclosure=Disclosure.EVERYTHING), requests)
-    greedy = greedy_response["documents"][0]["issuerSigned"]["nameSpaces"]
+    greedy = greedy_view.response["documents"][0]["issuerSigned"]["nameSpaces"]
     check("an over-sharing mdoc returns 11 elements over a real session",
           len(greedy[MDL_NAMESPACE]) == 11)
-    check("and the reader still verifies it",
-          verify(greedy_response, greedy_transcript, anchors),
+    check("and the reader still verifies it", greedy_view.verify(anchors),
           "end to end, the protocol offers no way to tell")
 
     # --- the transcript is load-bearing -------------------------------------

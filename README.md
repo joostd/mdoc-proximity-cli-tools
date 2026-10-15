@@ -76,9 +76,9 @@ first, bring up the wallet screen second.
 | File | Role |
 |---|---|
 | `mdoc_issuer.py` | Mints a credential: MSO, value digests, a two-level PKI, the mandatory mDL elements |
-| `mdoc_holder.py` | Parses a DeviceRequest, decides what to disclose, signs a DeviceResponse — and `HolderSession` runs the whole session, QR included |
+| `mdoc_holder.py` | Parses a DeviceRequest, decides what to disclose, signs or MACs a DeviceResponse — and `HolderSession` runs the whole session, QR included |
 
-### Tests — 137 checks, all passing
+### Tests — 143 checks, all passing
 
 | File | Checks | Against what |
 |---|---|---|
@@ -89,7 +89,7 @@ first, bring up the wallet screen second.
 | `test_mdoc_nfc.py` | 27 | The Annex D.5.1 handover, plus a Handover Select read off the wallet |
 | `test_mdoc_transport.py` | 16 | Loopback framing — chunk prefixes, State ordering, reassembly |
 | `test_mdoc_holder.py` | 19 | Issuer → holder → reader in one process, including over-disclosure |
-| `test_mdoc_session.py` | 18 | A whole presentation over the loopback: QR, ECDH, AES-GCM, both roles |
+| `test_mdoc_session.py` | 24 | A whole presentation over the loopback: QR, ECDH, AES-GCM, both variants of mdoc auth |
 
 ```sh
 for t in d51_session_encryption_test test_mdoc_transcript test_mdoc_auth \
@@ -225,11 +225,39 @@ anger.
 What this is still not is a wallet. There is no holder consent, no UI, no key
 attestation, and `HolderSession` has never driven a real radio — it speaks the
 `MdocTransport` contract, so `mdoc_ble.py` would accept it, but nothing in this
-repo has yet advertised as an mdoc. And `deviceMac` remains unwired: the holder
-only signs. The MAC variant needs `EMacKey` derived from the device key agreement
-and a correspondingly different `deviceKeyInfo`, and `mdoc_auth` verifies it
-against the Annex D.5.3 vector but has still never seen it from a live
-counterparty.
+repo has yet advertised as an mdoc.
+
+#### What a holder was for: `deviceMac`
+
+`mdoc_auth.verify_device_mac` has been correct against the Annex D.5.3 vector
+since the start and had never run against anything else, because neither wallet
+sends it and a reader cannot produce one. `MdocHolder(device_auth=DeviceAuth.MAC)`
+can, and `mdoc_reader.validate_response` now takes that branch.
+
+The asymmetry between the two variants is the interesting part, and it is not
+about strength. `deviceSignature` is ECDSA over `DeviceAuthenticationBytes`:
+anyone holding the transcript and the MSO can check it, *including someone who
+was not there*. `deviceMac` is an HMAC under `EMacKey`, derived by ECDH between
+the credential's static device key and `EReaderKey` — so only the reader in
+that session can verify it, and a transcript of the exchange proves nothing to
+a third party. Handing someone a signed response is handing them evidence;
+handing them a MACed one is not.
+
+That cuts both ways, and the tests assert both directions:
+
+```
+PASS  and the reader verifies it against EMacKey
+      first time this path has run outside the Annex D.5.3 vector
+PASS  a reader that discarded its ephemeral key cannot verify the MAC
+      unlike deviceSignature, the response is not evidence to anyone else
+PASS  nor can a reader holding the wrong ephemeral key
+      EMacKey agrees the device key with EReaderKey, not with the session keys
+```
+
+The practical cost is that `ereader_private` has to survive all the way down
+into `validate_response`, which for `deviceSignature` is needed nowhere past
+decryption. That is the signature change the variant forces, and the reason it
+sat unwired for as long as it did.
 
 ### Two ways in: QR and NFC
 
@@ -420,12 +448,10 @@ Start write into a dead service and a silent hang.
 - **No reader authentication.** The `DeviceRequest` carries no `readerAuth`, so
   the wallet cannot tell who is asking and will say so. Fixing this needs a
   reader certificate the wallet's trust list recognises.
-- **`deviceMac` is implemented but still unwired at both ends.** It is verified
-  against the Annex D.5.3 vectors in `test_mdoc_auth.py`; `mdoc_reader.py` only
-  takes the `deviceSignature` path, which is what the EUDI wallet uses, and
-  `mdoc_holder.py` only emits that path. A holder we control is the natural way
-  to close it — it needs `EMacKey` from the device key agreement and a
-  `deviceKeyInfo` to match — but writing the holder did not close it by itself.
+- **`deviceMac` has never been seen from a real wallet.** Both ends are wired
+  now and the round trip passes, but the only mdoc that has ever sent one is
+  `mdoc_holder.py`. Neither the EUDI wallet nor `org.siros.id` offers it, so
+  the variant is tested against a counterparty this repo also wrote.
 - **`HolderSession` has never driven a radio.** It speaks the `MdocTransport`
   contract, so `mdoc_ble.py` would take it, but nothing here has advertised as
   an mdoc. Everything the holder has presented, it presented over the loopback.
