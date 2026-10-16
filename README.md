@@ -82,6 +82,25 @@ mac$ .venv/bin/python mdoc_reader.py 'mdoc:owBjMS4w…' --trust-anchor iaca.pem 
 `--device-mac` makes it answer with `deviceMac` instead of `deviceSignature`,
 and `--disclosure everything` makes it the over-sharing wallet below.
 
+Pointing someone else's verifier at it — the EUDI reference verifier on an
+Android handset is the one this was tried against — wants `--full-chain`:
+
+```sh
+pi$  .venv/bin/python mdoc_wallet.py --reuse-pki pki.pem --full-chain
+```
+
+Without it the verifier connected, ran the whole session correctly, took the
+response, and displayed nothing but
+`Error [Attempt to invoke virtual method 'java.lang.Class
+java.lang.Object.getClass()' on a null object reference]`. Nothing was wrong
+with the response. `Utopia Test IACA` is in no trust list on earth, the
+verifier looked the anchor up by issuer DN, got null, and dereferenced it.
+Shipping the IACA in the x5chain gives the lookup something to find. It does
+not make the credential *trusted* — ours still checks the chain against the
+anchors it was given, which `test_mdoc_holder.py` asserts — but a verifier
+that can build a path can at least tell you it does not trust you, which is a
+diagnosis rather than a stack trace.
+
 ## What's here
 
 ### The reader
@@ -106,7 +125,7 @@ and `--disclosure everything` makes it the over-sharing wallet below.
 | `mdoc_ble_holder.py` | The `MdocTransport` contract from the mdoc's side — a GATT server and LE advertisement over BlueZ |
 | `mdoc_wallet.py` | The driver: mint, advertise, print the URI, present |
 
-### Tests — 146 checks, all passing
+### Tests — 154 checks, all passing
 
 | File | Checks | Against what |
 |---|---|---|
@@ -116,8 +135,8 @@ and `--disclosure everything` makes it the over-sharing wallet below.
 | `test_mdoc_reader.py` | 17 | A synthetic credential minted in-process, plus BLE mode choice and chunk sizing |
 | `test_mdoc_nfc.py` | 27 | The Annex D.5.1 handover, plus a Handover Select read off the wallet |
 | `test_mdoc_transport.py` | 16 | Loopback framing — chunk prefixes, State ordering, reassembly |
-| `test_mdoc_holder.py` | 19 | Issuer → holder → reader in one process, including over-disclosure |
-| `test_mdoc_session.py` | 24 | A whole presentation over the loopback: QR, ECDH, AES-GCM, both variants of mdoc auth |
+| `test_mdoc_holder.py` | 29 | Issuer → holder → reader in one process, including over-disclosure, Table 8 errors, and the encodings a foreign verifier cares about |
+| `test_mdoc_session.py` | 27 | A whole presentation over the loopback: QR, ECDH, AES-GCM, both variants of mdoc auth |
 
 ```sh
 for t in d51_session_encryption_test test_mdoc_transcript test_mdoc_auth \

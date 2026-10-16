@@ -98,7 +98,8 @@ async def serve_once(args) -> int:
     # A decodable portrait, unlike the repo's fixture default: this credential
     # is meant to be read by something that will try to draw it.
     credential, _ = mint(
-        sample_mdl_elements(portrait=PLACEHOLDER_PORTRAIT), pki=pki)
+        sample_mdl_elements(portrait=PLACEHOLDER_PORTRAIT), pki=pki,
+        include_anchor=args.full_chain)
 
     if args.save_anchor:
         Path(args.save_anchor).write_bytes(
@@ -189,6 +190,10 @@ def main() -> int:
                         help="how long to advertise before giving up")
     parser.add_argument("--timeout", type=float, default=60.0, metavar="SECONDS",
                         help="how long to wait for each message once connected")
+    parser.add_argument("--full-chain", action="store_true",
+                        help="send the IACA in the x5chain too, so a verifier "
+                             "that has never been given our anchor can still "
+                             "build a path to it (see `mdoc_issuer.mint`)")
     parser.add_argument("--no-qr", dest="qr", action="store_false",
                         help="skip the QR — it is 53 lines of ANSI escapes, "
                              "which is not what you want in a log file")

@@ -135,6 +135,49 @@ def main() -> int:
           and "[FAIL]" not in report, f"{report.count('[ok]')} ok, "
           f"{report.count('[FAIL]')} failed")
 
+    # --- what the wire looks like to someone else ----------------------------
+    #
+    # Both of these were invisible to the reader in this repo, which accepts
+    # either encoding, and cost an evening in front of a verifier that does
+    # not. Checked against `live-response.cbor` and `siros-mdl.cbor`, captured
+    # off wallets that real verifiers accept.
+
+    protected, unprotected, payload, _ = credential.issuer_auth
+    validity = cbor2.loads(cbor2.loads(payload).value)["validityInfo"]
+    check("ValidityInfo tdate has no fractional seconds",
+          all(moment.microsecond == 0 for moment in validity.values()),
+          f"signed {validity['signed'].isoformat().replace('+00:00', 'Z')}")
+
+    check("a one-certificate x5chain is a bstr, not an array of one",
+          isinstance(unprotected[33], bytes),
+          "RFC 9360 §2 — an array is for a chain of two or more")
+
+    # --- carrying the anchor, and why it buys nothing ------------------------
+    #
+    # A verifier that has never heard of our IACA has to find the anchor by
+    # issuer DN, and the EUDI reference verifier dereferences that lookup
+    # without a null check: it threw `getClass() on a null object reference`
+    # and showed an empty result for every response this repo sent it, until
+    # the IACA travelled in the chain. The response grew 1542 -> 1927 bytes
+    # and the mDL finally rendered.
+
+    anchored, anchored_pki = mint(sample_mdl_elements(), include_anchor=True)
+    chain = anchored.issuer_auth[1][33]
+    check("include_anchor makes the x5chain an array of two",
+          isinstance(chain, list) and len(chain) == 2,
+          "DS then IACA, leaf first, as RFC 9360 orders it")
+
+    ok, report = verify(MdocHolder([anchored]).respond(request, transcript),
+                        transcript, [anchored_pki.iaca_certificate])
+    check("and the reader reads a two-certificate chain", ok)
+
+    _, stranger_pki = mint(sample_mdl_elements())
+    ok, report = verify(MdocHolder([anchored]).respond(request, transcript),
+                        transcript, [stranger_pki.iaca_certificate])
+    check("but an anchor is not trusted for having shipped itself",
+          not ok and "does not chain" in report,
+          "the chain is checked against the configured anchors, not itself")
+
     # --- the salt is per-item and random -------------------------------------
 
     salts = {cbor2.loads(i.value)["random"] for i in credential.namespaces[MDL_NAMESPACE]}

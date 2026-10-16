@@ -145,17 +145,29 @@ def _cose_key(public_key: ec.EllipticCurvePublicKey) -> dict:
     }
 
 
+def _whole_seconds(moment: datetime) -> datetime:
+    """A tdate has no fractional part. See `mint`."""
+    return moment.replace(microsecond=0)
+
+
 def _cose_sign1(private_key, payload: bytes, certificates: list[x509.Certificate]):
-    """COSE_Sign1 with the x5chain in the *unprotected* header, label 33."""
+    """COSE_Sign1 with the x5chain in the *unprotected* header, label 33.
+
+    RFC 9360 §2: one certificate goes in as a bare bstr, and only a chain of
+    two or more becomes an array. An array of one is a different encoding of
+    the same chain, and a reader is entitled to reject it — ours accepts both,
+    which is exactly why this was invisible here for so long. The two EUDI
+    captures in this repo send a bstr; the Siros one sends an array of two.
+    """
     protected = cbor2.dumps({1: COSE_ALG_ES256})
     signature = private_key.sign(
         cbor2.dumps(["Signature1", protected, b"", payload]),
         ec.ECDSA(hashes.SHA256()))
     r, s = utils.decode_dss_signature(signature)
+    ders = [c.public_bytes(serialization.Encoding.DER) for c in certificates]
     return [
         protected,
-        {COSE_HEADER_X5CHAIN: [c.public_bytes(serialization.Encoding.DER)
-                               for c in certificates]},
+        {COSE_HEADER_X5CHAIN: ders[0] if len(ders) == 1 else ders},
         payload,
         r.to_bytes(32, "big") + s.to_bytes(32, "big"),
     ]
@@ -170,6 +182,7 @@ def mint(
     valid_from: datetime | None = None,
     valid_until: datetime | None = None,
     signed_at: datetime | None = None,
+    include_anchor: bool = False,
 ) -> tuple[Credential, Pki]:
     """Issue a credential over `elements`, a mapping of namespace -> {id: value}.
 
@@ -179,12 +192,27 @@ def mint(
 
     `valid_from` / `valid_until` are exposed so a test can mint an expired
     credential without waiting a year for one.
+
+    `include_anchor` puts the IACA into the x5chain as well. 9.1.2.4 does not
+    ask for it — the anchor is supposed to arrive out of band, and a chain that
+    carries its own root proves nothing a verifier should believe. It is here
+    because a verifier that has never heard of `Utopia Test IACA` has to look
+    the anchor up by issuer name, and at least one of them dereferences the
+    result without checking it for null. Shipping the root turns a crash into
+    an honest "untrusted", which is a far more useful thing to be told. The
+    Siros capture in this repo does the same.
     """
     pki = pki or generate_pki()
     device_private_key = device_private_key or ec.generate_private_key(ec.SECP256R1())
-    signed = signed_at or datetime.now(timezone.utc)
-    valid_from = valid_from or signed
-    valid_until = valid_until or (signed + timedelta(days=365))
+    # ValidityInfo is three tdate, and a tdate carries no fractional seconds:
+    # `2026-10-13T15:24:13Z`, not `…:13.976663Z`. `datetime.now` hands you
+    # microseconds, cbor2 faithfully writes them out, and a strict verifier
+    # then fails to parse the MSO it is standing in front of. All three real
+    # wallets captured in this repo send whole seconds.
+    signed = _whole_seconds(signed_at or datetime.now(timezone.utc))
+    valid_from = _whole_seconds(valid_from) if valid_from else signed
+    valid_until = (_whole_seconds(valid_until) if valid_until
+                   else signed + timedelta(days=365))
 
     namespaces: dict[str, list[cbor2.CBORTag]] = {}
     digests: dict[str, dict[int, bytes]] = {}
@@ -221,7 +249,7 @@ def mint(
     issuer_auth = _cose_sign1(
         pki.ds_key,
         cbor2.dumps(tag24(cbor2.dumps(mso))),
-        [pki.ds_certificate],
+        [pki.ds_certificate] + ([pki.iaca_certificate] if include_anchor else []),
     )
     return Credential(doc_type=doc_type, issuer_auth=issuer_auth,
                       namespaces=namespaces,
