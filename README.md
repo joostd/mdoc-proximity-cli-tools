@@ -141,6 +141,61 @@ satisfy a request for them as written, so that request is unsatisfiable by
 construction — and because Table 8 goes unread, nothing on the verifier will
 ever tell you so.
 
+### A credential someone else signed
+
+`--full-chain` buys a render, not trust. The verifier's trust list is seven
+PEMs compiled into the binary (`ConfigProvider.kt:67`), and `Utopia Test IACA`
+will never be one of them. The other way round is to stop minting and ask the
+EUDI reference issuer for an mDL, which `mdoc_fetch.py` does over OpenID4VCI:
+
+```sh
+mac$ .venv/bin/python mdoc_fetch.py --save mdl.bundle
+     # open the URL it prints, pick a country, fill in the form, consent
+mac$ scp mdl.bundle joostd@raspberrypi.local:mdoc/
+pi$  python3 mdoc_wallet.py --credential mdl.bundle
+```
+
+The reason it is worth the trouble is the chain. Both live instances publish
+an `issuer_info` JWT whose `x5c` roots in `CN=PID Issuer CA - UT 02,
+O=EUDI Wallet Reference Implementation, C=UT` — and that root is byte-identical
+to `pidissuerca02_ut.pem` in the verifier's own bundle, down to the serial
+(`130C9B15…`) and the SHA-256 (`F5:D8:B0:3D:…:45:00`). A credential signed
+under it comes up *trusted*, with no `--full-chain` and no rebuild.
+
+Two things the script makes plain that the metadata does not.
+
+The proof of possession proves nothing. `eu.europa.ec.eudi.mdl_mdoc` advertises
+`key_attestations_required` with `key_storage: ["iso_18045_high"]` on both the
+`jwt` and `attestation` proof types — keys in certified hardware. The server
+never checks: `route_oidc.py:417` lifts the public key out of
+`jwt.get_unverified_header(...)["jwk"]` and verifies no signature over it, and
+`grep -rn key_attestation --include='*.py' app/` finds no enforcement anywhere.
+A P-256 key generated in Python on a Pi is accepted and bound into the MSO's
+`deviceKeyInfo`, which is the only reason the holder here can present the
+result at all. `mdoc_fetch` signs the proof correctly regardless; the étude is
+about what the protocol asks for, not what this deployment settles for.
+
+And the issuer agrees about Table 5. Its mDL claim list is 32 entries: the 31
+rows of Table 5 that can actually be issued, plus `age_over_18`. No
+`age_over_NN`. No `biometric_template_xx`, and no biometric template of any
+kind. It instantiated the two template rows exactly the way
+`sample_mdl_elements(complete=True)` does — which means the reference
+*verifier's* full-mDL request cannot be satisfied by the reference *issuer*
+either. Two halves of the same project, and Table 8 would have said so if
+anything read it.
+
+What this costs is the thing the rest of the repo is for. Both conformance
+bugs found here — fractional `tdate` seconds and a one-element x5chain array —
+were found by controlling the bytes and diffing them against captures.
+A fetched credential is a black box: no control over `validityInfo`, salts,
+digest algorithm or the element set. So it is an artifact to compare against,
+not a replacement for `mdoc_issuer`.
+
+A last note on what "real" means here. The reference issuer's mock path puts
+*you* at a web form typing the attribute values in, and nothing verifies them.
+The credential is real in the sense that a real CA signed it, and in no other
+sense.
+
 ## What's here
 
 ### The reader
@@ -164,8 +219,9 @@ ever tell you so.
 | `mdoc_holder.py` | Parses a DeviceRequest, decides what to disclose, signs or MACs a DeviceResponse — and `HolderSession` runs the whole session, QR included |
 | `mdoc_ble_holder.py` | The `MdocTransport` contract from the mdoc's side — a GATT server and LE advertisement over BlueZ |
 | `mdoc_wallet.py` | The driver: mint, advertise, print the URI, present |
+| `mdoc_fetch.py` | The other way to get a credential: OpenID4VCI against the EUDI reference issuer, for one signed by a CA the verifier already trusts |
 
-### Tests — 157 checks, all passing
+### Tests — 179 checks, all passing
 
 | File | Checks | Against what |
 |---|---|---|
@@ -177,13 +233,17 @@ ever tell you so.
 | `test_mdoc_transport.py` | 16 | Loopback framing — chunk prefixes, State ordering, reassembly |
 | `test_mdoc_holder.py` | 32 | Issuer → holder → reader in one process, including over-disclosure, Table 8 errors, and the encodings a foreign verifier cares about |
 | `test_mdoc_session.py` | 27 | A whole presentation over the loopback: QR, ECDH, AES-GCM, both variants of mdoc auth |
+| `test_mdoc_fetch.py` | 17 | The OpenID4VCI proof we sign and the credential we parse back, with the six HTTP calls between them left out |
 
 ```sh
 for t in d51_session_encryption_test test_mdoc_transcript test_mdoc_auth \
          test_mdoc_reader test_mdoc_nfc test_mdoc_transport test_mdoc_holder \
-         test_mdoc_session
+         test_mdoc_session test_mdoc_fetch
 do .venv/bin/python $t.py; done
 ```
+
+(The header said 157 until now, which was 162 minus the five Annex D.5.1
+checks the table had always listed. Counted, not recalled.)
 
 ### Notes and artifacts
 

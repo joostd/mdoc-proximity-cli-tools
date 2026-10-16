@@ -26,6 +26,11 @@ exactly the way a real trust list is annoying, which is the point —
 `--save-anchor` writes it out, and `--reuse-pki` keeps one across runs so you
 only have to copy it once.
 
+`--credential` presents one fetched from the EUDI reference issuer by
+`mdoc_fetch.py` instead. Nothing here changes: the holder does not care who
+signed what it is holding. The difference is on the other side, where the
+chain lands on a CA the verifier was shipped with.
+
 This is not a wallet in any sense a user would recognise: no consent prompt,
 no UI, no key attestation, and the device private key sits in memory rather
 than a secure element. It is the holder half of the protocol with a radio
@@ -94,19 +99,33 @@ def load_or_make_pki(path: Path | None):
 
 
 async def serve_once(args) -> int:
-    pki = load_or_make_pki(Path(args.reuse_pki) if args.reuse_pki else None)
-    # A decodable portrait, unlike the repo's fixture default: this credential
-    # is meant to be read by something that will try to draw it.
-    credential, _ = mint(
-        sample_mdl_elements(portrait=PLACEHOLDER_PORTRAIT,
-                            complete=args.full_mdl),
-        pki=pki, include_anchor=args.full_chain)
+    if args.credential:
+        # Someone else's credential, fetched by `mdoc_fetch.py`. The holder
+        # does not care who minted it — it needs the IssuerSigned and the
+        # device private key, and a bundle is exactly those two things. The
+        # PKI options below are meaningless here: we did not issue this and
+        # have no anchor to hand out, which is the trade `mdoc_fetch` makes.
+        from mdoc_fetch import load_credential
 
-    if args.save_anchor:
-        Path(args.save_anchor).write_bytes(
-            pki.iaca_certificate.public_bytes(serialization.Encoding.PEM))
-        print(f"IACA written to {args.save_anchor} — copy it to the reader and "
-              f"pass it as --trust-anchor")
+        credential = load_credential(Path(args.credential))
+        for flag in ("reuse_pki", "save_anchor", "full_chain", "full_mdl"):
+            if getattr(args, flag):
+                print(f"(ignoring --{flag.replace('_', '-')}: "
+                      f"--credential does not mint anything)")
+    else:
+        pki = load_or_make_pki(Path(args.reuse_pki) if args.reuse_pki else None)
+        # A decodable portrait, unlike the repo's fixture default: this
+        # credential is meant to be read by something that will try to draw it.
+        credential, _ = mint(
+            sample_mdl_elements(portrait=PLACEHOLDER_PORTRAIT,
+                                complete=args.full_mdl),
+            pki=pki, include_anchor=args.full_chain)
+
+        if args.save_anchor:
+            Path(args.save_anchor).write_bytes(
+                pki.iaca_certificate.public_bytes(serialization.Encoding.PEM))
+            print(f"IACA written to {args.save_anchor} — copy it to the reader "
+                  f"and pass it as --trust-anchor")
 
     holder = MdocHolder(
         [credential],
@@ -199,6 +218,11 @@ def main() -> int:
                         help="hold all 33 elements of Table 5, not just the 11 "
                              "mandatory ones, so a 'full mDL' request comes "
                              "back without Table 8 errors")
+    parser.add_argument("--credential", metavar="PATH",
+                        help="present a credential fetched from a real issuer "
+                             "by `mdoc_fetch.py` instead of minting one — it "
+                             "chains to a CA the EUDI verifier already trusts, "
+                             "so it renders trusted rather than merely renders")
     parser.add_argument("--no-qr", dest="qr", action="store_false",
                         help="skip the QR — it is 53 lines of ANSI escapes, "
                              "which is not what you want in a log file")

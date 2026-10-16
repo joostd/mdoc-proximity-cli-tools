@@ -322,11 +322,12 @@ class MdocHolder:
                       + f", {self._device_auth.value}")
             for namespace, absent_elements in missing.items():
                 # Named, not just counted. A Table 8 error is a well-formed
-                # answer and our reader takes it in its stride, but it is also
-                # the shape that makes verifier UIs fall over — they ask for an
-                # element, look it up in the response, and dereference the
-                # miss. When that happens you want to know which names to mint,
-                # and counting them does not tell you.
+                # answer and nothing is wrong with sending one, but the names
+                # are the only place a reader's request is quoted back at you,
+                # and a count is not. This is what showed that the EUDI
+                # verifier's full-mDL request asks for `biometric_template_xx`
+                # verbatim — a Table 5 template row, unsatisfiable by any
+                # credential. A line saying "1 not held" would have hidden it.
                 self._log(f"  not held in {namespace}: "
                           + ", ".join(sorted(absent_elements)))
 
