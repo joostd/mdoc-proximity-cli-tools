@@ -47,6 +47,23 @@ EKU_MDL_DS = x509.ObjectIdentifier("1.0.18013.5.1.2")
 
 SALT_BYTES = 32  # 9.1.2.5 requires >= 16
 
+# 7.2.1 Table 5, all 33 rows, mandatory first. Worth having as data because a
+# verifier asking for a "full mDL" asks for exactly this, and the last two are
+# the reason that request can never be fully satisfied: they are templates,
+# not identifiers. An issuer writes `age_over_18` and `biometric_template_face`.
+TABLE_5 = (
+    "family_name", "given_name", "birth_date", "issue_date", "expiry_date",
+    "issuing_country", "issuing_authority", "document_number", "portrait",
+    "driving_privileges", "un_distinguishing_sign",
+    "administrative_number", "sex", "height", "weight", "eye_colour",
+    "hair_colour", "birth_place", "resident_address", "portrait_capture_date",
+    "age_in_years", "age_birth_year", "issuing_jurisdiction", "nationality",
+    "resident_city", "resident_state", "resident_postal_code",
+    "resident_country", "family_name_national_character",
+    "given_name_national_character", "signature_usual_mark",
+    "age_over_NN", "biometric_template_xx",
+)
+
 
 @dataclass
 class Pki:
@@ -275,7 +292,8 @@ PLACEHOLDER_PORTRAIT = base64.b64decode(
     "AALPB/mf9f8AC8U+BPd1rwmXAr//2Q==")
 
 
-def sample_mdl_elements(*, portrait: bytes = b"\xff\xd8\xff\xd9") -> dict:
+def sample_mdl_elements(*, portrait: bytes = b"\xff\xd8\xff\xd9",
+                        complete: bool = False) -> dict:
     """The mandatory mDL data elements from 7.2.1 Table 5.
 
     Dates are CBOR tag 1004 (full-date, RFC 8943) rather than tag 0 — an mDL
@@ -284,7 +302,51 @@ def sample_mdl_elements(*, portrait: bytes = b"\xff\xd8\xff\xd9") -> dict:
     `portrait` is an empty JPEG, since a real one is 10-20 kB and would make
     every fixture in this repo tedious to read; `PLACEHOLDER_PORTRAIT` above
     is a real one for when a real verifier is looking.
+
+    `complete` adds the 22 optional elements as well, for the 33 of Table 5 in
+    full. The point is not realism — it is that a verifier asking for a full
+    mDL and getting Table 8 errors for two thirds of it is a case real wallets
+    never put their UIs through. The EUDI reference verifier answers that with
+    `getClass() on a null object reference` and shows nothing, the same way it
+    does for an unknown trust anchor; holding all of Table 5 makes it render.
+
+    Which of the 22 it actually trips over is not known. It is not simply "any
+    absent element": the working run is still missing one, because the request
+    asks for `biometric_template_xx` *literally*. That and `age_over_NN` are
+    templates in the table rather than identifiers — xx is a biometric
+    modality, NN a real age — so they are instantiated here as
+    `biometric_template_face` and `age_over_18`, which is what an issuer would
+    do, and nothing can ever satisfy a request for the template itself.
     """
+    if complete:
+        return {MDL_NAMESPACE: {
+            **sample_mdl_elements(portrait=portrait)[MDL_NAMESPACE],
+            "administrative_number": "UT-ADM-0099",
+            "sex": 2,                       # ISO/IEC 5218: 0 unknown, 1 M, 2 F
+            "height": 170,                  # cm
+            "weight": 64,                   # kg
+            "eye_colour": "blue",           # Table 5 enumerates the values
+            "hair_colour": "blond",
+            "birth_place": "Utopia City",
+            "resident_address": "Hauptstrasse 1",
+            "portrait_capture_date": datetime(2024, 1, 15, 10, 30,
+                                              tzinfo=timezone.utc),
+            "age_in_years": 55,
+            "age_birth_year": 1971,
+            "age_over_18": True,
+            "age_over_21": True,
+            "issuing_jurisdiction": "UT-CT",   # ISO 3166-2
+            "nationality": "UT",               # ISO 3166-1 alpha-2
+            "resident_city": "Utopia City",
+            "resident_state": "Central",
+            "resident_postal_code": "10115",
+            "resident_country": "UT",
+            "biometric_template_face": b"\x00" * 32,
+            "family_name_national_character": "Mustermann",
+            "given_name_national_character": "Erika",
+            "signature_usual_mark": PLACEHOLDER_PORTRAIT,
+        }}
+
     return {MDL_NAMESPACE: {
         "family_name": "Mustermann",
         "given_name": "Erika",

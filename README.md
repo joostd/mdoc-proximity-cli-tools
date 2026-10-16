@@ -83,10 +83,10 @@ mac$ .venv/bin/python mdoc_reader.py 'mdoc:owBjMS4w…' --trust-anchor iaca.pem 
 and `--disclosure everything` makes it the over-sharing wallet below.
 
 Pointing someone else's verifier at it — the EUDI reference verifier on an
-Android handset is the one this was tried against — wants `--full-chain`:
+Android handset is the one this was tried against — wants two extra flags:
 
 ```sh
-pi$  .venv/bin/python mdoc_wallet.py --reuse-pki pki.pem --full-chain
+pi$  .venv/bin/python mdoc_wallet.py --reuse-pki pki.pem --full-chain --full-mdl
 ```
 
 Without it the verifier connected, ran the whole session correctly, took the
@@ -100,6 +100,30 @@ not make the credential *trusted* — ours still checks the chain against the
 anchors it was given, which `test_mdoc_holder.py` asserts — but a verifier
 that can build a path can at least tell you it does not trust you, which is a
 diagnosis rather than a stack trace.
+
+`--full-mdl` holds all 33 elements of Table 5 instead of the 11 mandatory
+ones, and buys exactly the same crash a second time. Ask that verifier for a
+*full* mDL while holding only the mandatory core and 22 of the 33 come back
+as Table 8 errors — a correct, well-formed answer that our reader takes in
+its stride — and the app shows the identical null dereference. Hold all of
+them and the mDL renders.
+
+Which of the 22 it trips over is still open. It is not "any absent element":
+the run that works is *still* missing one, because the request asks for
+`biometric_template_xx` literally. That and `age_over_NN` are templates in
+Table 5 rather than identifiers — xx is a biometric modality, NN a real age —
+so no credential can ever satisfy a request for them as written. The holder
+names the elements it does not hold under `-v`, which is how that surfaced:
+
+```
+[holder] org.iso.18013.5.1.mDL: asked 33, disclosing 32 (requested), 1 not held
+[holder]   not held in org.iso.18013.5.1: biometric_template_xx
+```
+
+The pattern across all of this is one thing: the parts of 18013-5 that say
+what a holder may legitimately *withhold* — an unknown anchor, an element it
+does not have — are the parts least exercised by wallets that always have
+everything, and they are where the verifiers break.
 
 ## What's here
 
@@ -125,7 +149,7 @@ diagnosis rather than a stack trace.
 | `mdoc_ble_holder.py` | The `MdocTransport` contract from the mdoc's side — a GATT server and LE advertisement over BlueZ |
 | `mdoc_wallet.py` | The driver: mint, advertise, print the URI, present |
 
-### Tests — 154 checks, all passing
+### Tests — 157 checks, all passing
 
 | File | Checks | Against what |
 |---|---|---|
@@ -135,7 +159,7 @@ diagnosis rather than a stack trace.
 | `test_mdoc_reader.py` | 17 | A synthetic credential minted in-process, plus BLE mode choice and chunk sizing |
 | `test_mdoc_nfc.py` | 27 | The Annex D.5.1 handover, plus a Handover Select read off the wallet |
 | `test_mdoc_transport.py` | 16 | Loopback framing — chunk prefixes, State ordering, reassembly |
-| `test_mdoc_holder.py` | 29 | Issuer → holder → reader in one process, including over-disclosure, Table 8 errors, and the encodings a foreign verifier cares about |
+| `test_mdoc_holder.py` | 32 | Issuer → holder → reader in one process, including over-disclosure, Table 8 errors, and the encodings a foreign verifier cares about |
 | `test_mdoc_session.py` | 27 | A whole presentation over the loopback: QR, ECDH, AES-GCM, both variants of mdoc auth |
 
 ```sh

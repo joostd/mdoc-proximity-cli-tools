@@ -24,7 +24,13 @@ import cbor2
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from mdoc_holder import Disclosure, HolderError, MdocHolder, parse_device_request
-from mdoc_issuer import MDL_DOC_TYPE, MDL_NAMESPACE, mint, sample_mdl_elements
+from mdoc_issuer import (
+    MDL_DOC_TYPE,
+    MDL_NAMESPACE,
+    TABLE_5,
+    mint,
+    sample_mdl_elements,
+)
 from mdoc_reader import build_device_request, validate_response
 from mdoc_transcript import (
     build_session_transcript,
@@ -121,6 +127,30 @@ def main() -> int:
           f"disclosed {opened}, errors {sorted(mixed_document.get('errors', {}).get(MDL_NAMESPACE, {}))}")
     check("the elements it does hold come back alongside",
           opened == ["family_name"])
+
+    # A verifier asking for a full mDL asks for all 33 rows of Table 5, two of
+    # which are templates rather than identifiers. `complete=True` answers the
+    # other 31 — the EUDI reference verifier shows nothing at all when most of
+    # a full request comes back as Table 8 errors, so holding the lot is the
+    # difference between a rendered mDL and a null dereference.
+    whole, _ = mint(sample_mdl_elements(complete=True), pki=pki)
+    held = set(whole.element_names()[MDL_NAMESPACE])
+    check("a complete mDL holds every Table 5 element that can be issued",
+          set(TABLE_5) - {"age_over_NN", "biometric_template_xx"} <= held,
+          f"{len(held)} held, {len(TABLE_5)} rows in Table 5")
+    check("and the two template rows are instantiated, not copied",
+          {"age_over_18", "biometric_template_face"} <= held
+          and not {"age_over_NN", "biometric_template_xx"} & held,
+          "NN is a real age, xx a biometric modality")
+
+    everything = build_device_request(
+        [(MDL_DOC_TYPE, {MDL_NAMESPACE: {name: False for name in TABLE_5}})])
+    whole_document = cbor2.loads(
+        MdocHolder([whole]).respond(everything, transcript))["documents"][0]
+    check("so a full-mDL request leaves errors only for the templates",
+          set(whole_document.get("errors", {})[MDL_NAMESPACE])
+          == {"age_over_NN", "biometric_template_xx"},
+          "nothing an issuer can mint will ever satisfy those two")
 
     ok, report = verify(cbor2.dumps({"version": "1.0", "status": 0,
                                      "documents": [mixed_document]}),

@@ -320,6 +320,15 @@ class MdocHolder:
                       f"disclosing {opened} ({self._disclosure.value})"
                       + (f", {absent} not held" if absent else "")
                       + f", {self._device_auth.value}")
+            for namespace, absent_elements in missing.items():
+                # Named, not just counted. A Table 8 error is a well-formed
+                # answer and our reader takes it in its stride, but it is also
+                # the shape that makes verifier UIs fall over — they ask for an
+                # element, look it up in the response, and dereference the
+                # miss. When that happens you want to know which names to mint,
+                # and counting them does not tell you.
+                self._log(f"  not held in {namespace}: "
+                          + ", ".join(sorted(absent_elements)))
 
             # DeviceNameSpaces is empty: these are elements the *device*
             # asserts rather than the issuer, and this holder has none. It is

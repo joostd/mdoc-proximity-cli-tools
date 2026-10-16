@@ -98,8 +98,9 @@ async def serve_once(args) -> int:
     # A decodable portrait, unlike the repo's fixture default: this credential
     # is meant to be read by something that will try to draw it.
     credential, _ = mint(
-        sample_mdl_elements(portrait=PLACEHOLDER_PORTRAIT), pki=pki,
-        include_anchor=args.full_chain)
+        sample_mdl_elements(portrait=PLACEHOLDER_PORTRAIT,
+                            complete=args.full_mdl),
+        pki=pki, include_anchor=args.full_chain)
 
     if args.save_anchor:
         Path(args.save_anchor).write_bytes(
@@ -194,6 +195,10 @@ def main() -> int:
                         help="send the IACA in the x5chain too, so a verifier "
                              "that has never been given our anchor can still "
                              "build a path to it (see `mdoc_issuer.mint`)")
+    parser.add_argument("--full-mdl", action="store_true",
+                        help="hold all 33 elements of Table 5, not just the 11 "
+                             "mandatory ones, so a 'full mDL' request comes "
+                             "back without Table 8 errors")
     parser.add_argument("--no-qr", dest="qr", action="store_false",
                         help="skip the QR — it is 53 lines of ANSI escapes, "
                              "which is not what you want in a log file")
