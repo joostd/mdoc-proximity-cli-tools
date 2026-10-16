@@ -83,10 +83,10 @@ mac$ .venv/bin/python mdoc_reader.py 'mdoc:owBjMS4w…' --trust-anchor iaca.pem 
 and `--disclosure everything` makes it the over-sharing wallet below.
 
 Pointing someone else's verifier at it — the EUDI reference verifier on an
-Android handset is the one this was tried against — wants two extra flags:
+Android handset is the one this was tried against — wants `--full-chain`:
 
 ```sh
-pi$  .venv/bin/python mdoc_wallet.py --reuse-pki pki.pem --full-chain --full-mdl
+pi$  .venv/bin/python mdoc_wallet.py --reuse-pki pki.pem --full-chain
 ```
 
 Without it the verifier connected, ran the whole session correctly, took the
@@ -101,29 +101,45 @@ anchors it was given, which `test_mdoc_holder.py` asserts — but a verifier
 that can build a path can at least tell you it does not trust you, which is a
 diagnosis rather than a stack trace.
 
-`--full-mdl` holds all 33 elements of Table 5 instead of the 11 mandatory
-ones, and buys exactly the same crash a second time. Ask that verifier for a
-*full* mDL while holding only the mandatory core and 22 of the 33 come back
-as Table 8 errors — a correct, well-formed answer that our reader takes in
-its stride — and the app shows the identical null dereference. Hold all of
-them and the mDL renders.
+That is the only thing that verifier needs. `--full-mdl` holds all 33
+elements of Table 5 rather than the 11 mandatory ones, which makes a fuller
+demo, but it fixes nothing: asking for a full mDL while holding only the
+mandatory core returns 22 Table 8 errors and renders the other 11 perfectly
+well.
 
-Which of the 22 it trips over is still open. It is not "any absent element":
-the run that works is *still* missing one, because the request asks for
-`biometric_template_xx` literally. That and `age_over_NN` are templates in
-Table 5 rather than identifiers — xx is a biometric modality, NN a real age —
-so no credential can ever satisfy a request for them as written. The holder
-names the elements it does not hold under `-v`, which is how that surfaced:
+It is worth saying because this repo briefly claimed otherwise. The same
+crash appeared on a full-mDL request, `--full-mdl` was added, the crash went
+away, and the obvious inference was wrong — that run had simply been started
+without `--full-chain`. Reading the verifier's source settled it, and a
+control run with `--full-chain` alone confirmed it on the handset. Two
+observations, one cause; the second variable was never tested on its own.
+
+Reading the source turned up the better finding anyway. The verifier app is a
+thin layer over multipaz's `DeviceResponseParser`, and that parser has no
+`errors` or `documentErrors` in it at all — the string constants are
+`issuerSigned`, `deviceSigned`, `digestID`, `elementValue` and so on, and
+nothing else. Table 8 and Table 9 are parsed by nobody. A verifier built on
+it cannot distinguish "the mdoc does not hold this" from "the holder declined
+to give it to you", because the error codes that carry that distinction are
+dropped before the app ever sees them. All it observes is a shorter list of
+claims. That is a far more interesting gap than a null check, and it is
+invisible from the wire: our response is correct, and the information in it
+is simply discarded.
+
+The holder names the elements it does not hold under `-v`, which turned up
+one more thing — a full-mDL request asks for `biometric_template_xx`
+*literally*:
 
 ```
 [holder] org.iso.18013.5.1.mDL: asked 33, disclosing 32 (requested), 1 not held
 [holder]   not held in org.iso.18013.5.1: biometric_template_xx
 ```
 
-The pattern across all of this is one thing: the parts of 18013-5 that say
-what a holder may legitimately *withhold* — an unknown anchor, an element it
-does not have — are the parts least exercised by wallets that always have
-everything, and they are where the verifiers break.
+That row of Table 5, and `age_over_NN`, are templates rather than
+identifiers: xx is a biometric modality, NN a real age. No credential can
+satisfy a request for them as written, so that request is unsatisfiable by
+construction — and because Table 8 goes unread, nothing on the verifier will
+ever tell you so.
 
 ## What's here
 

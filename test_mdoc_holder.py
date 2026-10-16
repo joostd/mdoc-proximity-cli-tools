@@ -129,10 +129,10 @@ def main() -> int:
           opened == ["family_name"])
 
     # A verifier asking for a full mDL asks for all 33 rows of Table 5, two of
-    # which are templates rather than identifiers. `complete=True` answers the
-    # other 31 — the EUDI reference verifier shows nothing at all when most of
-    # a full request comes back as Table 8 errors, so holding the lot is the
-    # difference between a rendered mDL and a null dereference.
+    # which are templates rather than identifiers, so `complete=True` answers
+    # 31 of them and no credential can ever answer the other two. Checked
+    # because the two template rows are easy to copy out of the table by
+    # mistake — the EUDI verifier's own full-mDL request does exactly that.
     whole, _ = mint(sample_mdl_elements(complete=True), pki=pki)
     held = set(whole.element_names()[MDL_NAMESPACE])
     check("a complete mDL holds every Table 5 element that can be issued",

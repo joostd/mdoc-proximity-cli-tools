@@ -304,19 +304,19 @@ def sample_mdl_elements(*, portrait: bytes = b"\xff\xd8\xff\xd9",
     is a real one for when a real verifier is looking.
 
     `complete` adds the 22 optional elements as well, for the 33 of Table 5 in
-    full. The point is not realism — it is that a verifier asking for a full
-    mDL and getting Table 8 errors for two thirds of it is a case real wallets
-    never put their UIs through. The EUDI reference verifier answers that with
-    `getClass() on a null object reference` and shows nothing, the same way it
-    does for an unknown trust anchor; holding all of Table 5 makes it render.
+    full, which is exactly what a verifier asking for a "full mDL" asks for.
+    It makes a fuller demo and nothing more: a verifier handed only the
+    mandatory core answers the other 22 with Table 8 errors and renders the 11
+    quite happily. This docstring previously claimed it was needed to stop the
+    EUDI reference verifier crashing. It was not — that run was missing
+    `--full-chain`, and the crash was the unknown-anchor one all over again.
 
-    Which of the 22 it actually trips over is not known. It is not simply "any
-    absent element": the working run is still missing one, because the request
-    asks for `biometric_template_xx` *literally*. That and `age_over_NN` are
-    templates in the table rather than identifiers — xx is a biometric
-    modality, NN a real age — so they are instantiated here as
-    `biometric_template_face` and `age_over_18`, which is what an issuer would
-    do, and nothing can ever satisfy a request for the template itself.
+    `age_over_NN` and `biometric_template_xx` are templates in the table, not
+    identifiers: NN is a real age and xx a biometric modality. They are
+    instantiated here as `age_over_18` and `biometric_template_face`, which is
+    what an issuer would do, so a request naming the templates themselves —
+    and the EUDI verifier's full-mDL request names `biometric_template_xx`
+    verbatim — is unsatisfiable by construction.
     """
     if complete:
         return {MDL_NAMESPACE: {
