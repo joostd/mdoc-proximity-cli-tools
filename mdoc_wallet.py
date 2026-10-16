@@ -221,8 +221,8 @@ def main() -> int:
     parser.add_argument("--credential", metavar="PATH",
                         help="present a credential fetched from a real issuer "
                              "by `mdoc_fetch.py` instead of minting one — it "
-                             "chains to a CA the EUDI verifier already trusts, "
-                             "so it renders trusted rather than merely renders")
+                             "chains to a CA the EUDI verifier was shipped "
+                             "with, so no --full-chain and no rebuild")
     parser.add_argument("--no-qr", dest="qr", action="store_false",
                         help="skip the QR — it is 53 lines of ANSI escapes, "
                              "which is not what you want in a log file")
