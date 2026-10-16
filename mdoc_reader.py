@@ -272,12 +272,17 @@ async def run(device_engagement_raw: bytes, requests: list[tuple[str, dict]],
               anchors: list, *, handover=None, service_uuid_override: bytes | None = None,
               mode_override: str | None = None, ble_mode: str = "auto",
               require_chain: bool, dry_run: bool, verbose: bool,
-              save: str | None = None) -> int:
+              save: str | None = None, tcp: tuple[str, int] | None = None) -> int:
     engagement = parse_device_engagement(device_engagement_raw)
     print(f"Engagement: version {engagement.version}, cipher suite "
           f"{engagement.cipher_suite}")
 
-    if service_uuid_override is not None:
+    if tcp is not None:
+        # No radio, so no mode to choose and no UUID to scan for: the
+        # engagement's retrieval methods are ignored on purpose. See mdoc_tcp.
+        mode = None
+        print(f"Transport: TCP {tcp[0]}:{tcp[1]} — standing in for the BLE link")
+    elif service_uuid_override is not None:
         # NFC static handover: the engagement carries no retrieval methods, so
         # the transport comes from the NDEF Bluetooth LE OOB carrier instead —
         # its LE Role byte is the only statement of who is central.
@@ -299,8 +304,10 @@ async def run(device_engagement_raw: bytes, requests: list[tuple[str, dict]],
                     ("central client", engagement.ble.central_client_mode)) if on]
         source = f" (mdoc offers: {', '.join(offered)})"
 
-    service_uuid = mdoc_ble.service_uuid_str(uuid_bytes)
-    print(f"Transport: BLE, {MODE_DESCRIPTION[mode]}, service {service_uuid}{source}")
+    if mode is not None:
+        service_uuid = mdoc_ble.service_uuid_str(uuid_bytes)
+        print(f"Transport: BLE, {MODE_DESCRIPTION[mode]}, "
+              f"service {service_uuid}{source}")
 
     # Fresh ephemeral key per transaction — these are never reused (9.1.1.4).
     ereader_private = ec.generate_private_key(ec.SECP256R1())
@@ -328,7 +335,11 @@ async def run(device_engagement_raw: bytes, requests: list[tuple[str, dict]],
         print(f"  {cbor2.loads(device_request)}")
         return 0
 
-    if mode == "central-client":
+    if tcp is not None:
+        import mdoc_tcp
+        print(f"\nConnecting to the wallet at {tcp[0]}:{tcp[1]} …")
+        link_context = mdoc_tcp.TcpTransport(tcp[0], tcp[1], verbose=verbose)
+    elif mode == "central-client":
         # We are the GATT server, so there is nothing to scan for: we
         # advertise and the wallet comes to us. Ident is how it checks it
         # reached the right reader (8.3.3.1.1.3).
@@ -415,6 +426,10 @@ def main() -> int:
                         help="which side is the GATT server. auto follows the "
                              "engagement, preferring mdoc central client mode "
                              "when the mdoc offers both (8.3.3.1.1.1)")
+    parser.add_argument("--tcp", metavar="HOST:PORT",
+                        help="talk to a wallet over a socket instead of a radio, "
+                             "for driving an implementation under development "
+                             "(see mdoc_tcp)")
     parser.add_argument("--trust-anchor", action="append", default=[], metavar="PEM",
                         help="IACA certificate; repeatable")
     parser.add_argument("--dry-run", action="store_true",
@@ -426,6 +441,15 @@ def main() -> int:
                         help="write the decrypted response and its transcript as CBOR")
     parser.add_argument("-v", "--verbose", action="store_true", help="BLE tracing")
     args = parser.parse_args()
+
+    tcp = None
+    if args.tcp:
+        host, _, port = args.tcp.rpartition(":")
+        if not port.isdigit():
+            parser.error("--tcp wants HOST:PORT")
+        tcp = (host or "127.0.0.1", int(port))
+        if args.nfc:
+            parser.error("--tcp and --nfc are different transports")
 
     anchors = [x509.load_pem_x509_certificate(open(p, "rb").read())
                for p in args.trust_anchor]
@@ -506,7 +530,7 @@ def main() -> int:
                            service_uuid_override=service_uuid_override,
                            mode_override=mode_override, ble_mode=args.ble_mode,
                            require_chain=bool(anchors), dry_run=args.dry_run,
-                           verbose=args.verbose, save=args.save))
+                           verbose=args.verbose, save=args.save, tcp=tcp))
 
 
 if __name__ == "__main__":
